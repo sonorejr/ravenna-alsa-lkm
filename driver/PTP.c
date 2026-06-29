@@ -59,13 +59,14 @@
 //////////////////////////////////////////////////////////////
 void get_ptp_global_times(TClock_PTP* self, uint64_t* pui64GlobalSAC, uint64_t* pui64GlobalTime, uint64_t* pui64GlobalPerformanceCounter) // get the time and the SAC atomically
 {
-    spin_lock((spinlock_t*)self->m_csSAC_Time_Lock);
+    unsigned long flags; // PREEMPT-fix: m_cs* lock taken in process + softirq ctx -> must irqsave
+    spin_lock_irqsave((spinlock_t*)self->m_csSAC_Time_Lock, flags);
 
     *pui64GlobalSAC = self->m_ui64GlobalSAC;
     *pui64GlobalTime = self->m_ui64GlobalTime;
     *pui64GlobalPerformanceCounter = self->m_ui64GlobalPerformanceCounter;
 
-    spin_unlock((spinlock_t*)self->m_csSAC_Time_Lock);
+    spin_unlock_irqrestore((spinlock_t*)self->m_csSAC_Time_Lock, flags);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -200,8 +201,9 @@ void destroy_ptp(TClock_PTP* self)
 ///////////////////////////////////////////////////////////////////////////////
 void ResetPTPLock(TClock_PTP* self, bool bUseMutex)
 {
+    unsigned long flags; // PREEMPT-fix: m_cs* lock taken in process + softirq ctx -> must irqsave
 	if(bUseMutex)
-		spin_lock((spinlock_t*)self->m_csPTPTime);
+		spin_lock_irqsave((spinlock_t*)self->m_csPTPTime, flags);
 
 	{
 		MTAL_DP("[%u] ResetPTPLock()\n", self->m_pEth_netfilter->nic_id);
@@ -212,7 +214,7 @@ void ResetPTPLock(TClock_PTP* self, bool bUseMutex)
 	}
 
 	if(bUseMutex)
-		spin_unlock((spinlock_t*)self->m_csPTPTime);
+		spin_unlock_irqrestore((spinlock_t*)self->m_csPTPTime, flags);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -228,6 +230,7 @@ void SetPTPMasterPortNumber(TClock_PTP* self, unsigned short const usPTPMasterPo
 ///////////////////////////////////////////////////////////////////////////////
 EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketBase, uint32_t ui32PacketSize)
 {
+    unsigned long flags; // PREEMPT-fix: m_cs* lock taken in process + softirq ctx -> must irqsave
     TPTPPacketBase* pPTPPacketBase = (TPTPPacketBase*)pUDPPacketBase;
 	if(!self->m_bInitialized || !self->m_bAudioFrameTICTimerStarted)
 	{
@@ -417,7 +420,7 @@ EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketB
 			{
 				// Atomicity
                 {
-                    spin_lock((spinlock_t*)self->m_csPTPTime);
+                    spin_lock_irqsave((spinlock_t*)self->m_csPTPTime, flags);
 
 					self->m_ui64DeltaT2 = ui64T2 - self->m_ui64T2;
 					//MTAL_DP("%I64u Delta T2= %I64u\n", ui64T2, ui64T2 - self->m_ui64T2);
@@ -430,7 +433,7 @@ EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketB
 					self->m_ui64T2 = ui64T2;
 					self->m_ui64TIC_LastRTXClockTimeAtT2 = self->m_ui64TIC_LastRTXClockTime;
 
-                    spin_unlock((spinlock_t*)self->m_csPTPTime);
+                    spin_unlock_irqrestore((spinlock_t*)self->m_csPTPTime, flags);
 				}
 
 				//MTAL_DP("Flags: 0x%x\n", MTAL_SWAP16(pPTPV2MsgSyncPacket->V2MsgHeader.wFlags));
@@ -525,6 +528,7 @@ void ResetPTPMaster(TClock_PTP* self)
 // from Sync or Follow_up
 void ProcessT1(TClock_PTP* self, uint64_t ui64T1)
 {
+    unsigned long flags; // PREEMPT-fix: m_cs* lock taken in process + softirq ctx -> must irqsave
 	uint64_t ui64DeltaT1 = ui64T1 - self->m_ui64T1;
 	if (ui64DeltaT1 == 0)
 	{
@@ -537,7 +541,7 @@ void ProcessT1(TClock_PTP* self, uint64_t ui64T1)
 	}*/
 	// Atomicity
 	{
-        spin_lock((spinlock_t*)self->m_csPTPTime);
+        spin_lock_irqsave((spinlock_t*)self->m_csPTPTime, flags);
 		if (self->m_usPTPLockCounter > 0)
 		{
 			self->m_usPTPLockCounter--;
@@ -707,14 +711,14 @@ void ProcessT1(TClock_PTP* self, uint64_t ui64T1)
                 //MTAL_DP("%I64u / %I64u = %e\n", self->m_ui64TIC_PTPClockTimeFromOrigin ,self->m_ui64TIC_RTXClockTimeFromOrigin, (double)self->m_ui64TIC_PTPClockTimeFromOrigin / (double)self->m_ui64TIC_RTXClockTimeFromOrigin - 1.);
 			} while (0);
 		}
-		spin_unlock((spinlock_t*)self->m_csPTPTime);
+		spin_unlock_irqrestore((spinlock_t*)self->m_csPTPTime, flags);
 	}
 
 	//MTAL_DP("Delta T1= %I64u\n", ui64T1 - self->m_ui64T1);
 	//MTAL_DP("self->m_ui64PTPClockTimeFromOrigin %I64u,  self->m_ui64TC_RTXClockOriginTime= %I64u PTP/RTX = %I64u = %e\n", self->m_ui64PTPClockTimeFromOrigin, self->m_ui64RTXClockTimeFromOrigin, (uint64_t)(CInt128(self->m_ui64PTPClockTimeFromOrigin) / CInt128(self->m_ui64RTXClockTimeFromOrigin)), (double)self->m_ui64PTPClockTimeFromOrigin / (double)self->m_ui64RTXClockTimeFromOrigin);
 
 	// Atomicity
-    spin_lock((spinlock_t*)self->m_csPTPTime);
+    spin_lock_irqsave((spinlock_t*)self->m_csPTPTime, flags);
 	if (self->m_usPTPLockCounter == 0)
 	{
 		// Stats
@@ -727,7 +731,7 @@ void ProcessT1(TClock_PTP* self, uint64_t ui64T1)
 			}
 		}
 	}
-    spin_unlock((spinlock_t*)self->m_csPTPTime);
+    spin_unlock_irqrestore((spinlock_t*)self->m_csPTPTime, flags);
 
 	self->m_ui64T1 = ui64T1;
 }
@@ -834,13 +838,15 @@ void computeNextAbsoluteTime(TClock_PTP* self, uint32_t ui32FrameCount)
 
 void timerSetNextAbsoluteTime(TClock_PTP* self, uint64_t ui64NextAbsoluteTime)
 {
-	spin_lock/*_irqsave*/((spinlock_t*)self->m_csPTPTime/*, flags*/);
+    unsigned long flags; // PREEMPT-fix: m_cs* lock taken in process + softirq ctx -> must irqsave
+	spin_lock_irqsave((spinlock_t*)self->m_csPTPTime, flags);
 	self->m_ui64TIC_NextAbsoluteTime = ui64NextAbsoluteTime / NS_2_REF_UNIT;
-	spin_unlock/*_irqrestore*/((spinlock_t*)self->m_csPTPTime/*, flags*/);
+	spin_unlock_irqrestore((spinlock_t*)self->m_csPTPTime, flags);
 }
 
 void timerProcess(TClock_PTP* self, uint64_t* pui64NextRTXClockTime, uint64_t ui64RTXClockTime)
 {
+    unsigned long flags; // PREEMPT-fix: m_cs* lock taken in process + softirq ctx -> must irqsave
 	// debug
 	//int iTICCountUpdateMethod = 0;
 	int32_t clkJitter;
@@ -888,7 +894,7 @@ void timerProcess(TClock_PTP* self, uint64_t* pui64NextRTXClockTime, uint64_t ui
 
 	// Atomicity
 	{
-        spin_lock((spinlock_t*)self->m_csPTPTime);
+        spin_lock_irqsave((spinlock_t*)self->m_csPTPTime, flags);
 		// Stat; compute must be protected by self->m_csPTPTime for atomicity
         /*{
             CMTAL_PerfMonInterval pmiTICIntervalTmp
@@ -947,20 +953,20 @@ void timerProcess(TClock_PTP* self, uint64_t* pui64NextRTXClockTime, uint64_t ui
         }
 
         ui64AbsoluteTime = self->m_ui64TIC_NextAbsoluteTime;
-        spin_unlock((spinlock_t*)self->m_csPTPTime);
+        spin_unlock_irqrestore((spinlock_t*)self->m_csPTPTime, flags);
     }
 
     //MTAL_DP("TIC Intervale = %llu ui64Period = %llu", self->m_pmiTICInterval.GetLastUsedInterval(), ui64Period);
 
     self->m_ui64TICSAC = (ui64CurrentTICCount - 1) * self->m_ui32FrameSize;
     {
-        spin_lock((spinlock_t*)self->m_csSAC_Time_Lock);
+        spin_lock_irqsave((spinlock_t*)self->m_csSAC_Time_Lock, flags);
         {
             self->m_ui64GlobalPerformanceCounter = MTAL_LK_GetCounterTime();
             self->m_ui64GlobalTime = ui64CurrentRTXClockTime;
             self->m_ui64GlobalSAC = self->m_ui64TICSAC;
         }
-        spin_unlock((spinlock_t*)self->m_csSAC_Time_Lock);
+        spin_unlock_irqrestore((spinlock_t*)self->m_csSAC_Time_Lock, flags);
     }
 
 	//// Call AudioTICFrame now done in module_main
@@ -969,12 +975,12 @@ void timerProcess(TClock_PTP* self, uint64_t* pui64NextRTXClockTime, uint64_t ui
 	// Check the link status
 	if(!IsLinkUp(self->m_pEth_netfilter) && GetLockStatus(self) != PTPLS_UNLOCKED)
 	{
-		spin_lock((spinlock_t*)self->m_csPTPTime);
+		spin_lock_irqsave((spinlock_t*)self->m_csPTPTime, flags);
 		{
 			MTAL_DP("[%u] PTP detects that the link is down\n", self->m_pEth_netfilter->nic_id);
 			ResetPTPLock(self, false);
 		}
-		spin_unlock((spinlock_t*)self->m_csPTPTime);
+		spin_unlock_irqrestore((spinlock_t*)self->m_csPTPTime, flags);
 	}
 
 	// PTP watch dog
@@ -982,7 +988,7 @@ void timerProcess(TClock_PTP* self, uint64_t* pui64NextRTXClockTime, uint64_t ui
         uint64_t ui64WatchDogElapse = ui64CurrentRTXClockTime - self->m_ui64LastWatchDogTime;
         if(ui64WatchDogElapse >= PTP_WATCHDOG_ELAPSE)
         {
-            spin_lock((spinlock_t*)self->m_csPTPTime);
+            spin_lock_irqsave((spinlock_t*)self->m_csPTPTime, flags);
             if(self->m_wLastWatchDogSyncSequenceId == self->m_wLastSyncSequenceId && GetLockStatus(self) != PTPLS_UNLOCKED)
             {
                 printk("[%u] PTP Master sync timeout, resetting ...\n", self->m_pEth_netfilter->nic_id);
@@ -990,7 +996,7 @@ void timerProcess(TClock_PTP* self, uint64_t* pui64NextRTXClockTime, uint64_t ui
                 MTAL_DP("[%u] ui64WatchDogElapse = %llu = %llu - %llu\n", self->m_pEth_netfilter->nic_id, ui64WatchDogElapse, ui64CurrentRTXClockTime, self->m_ui64LastWatchDogTime);
                 ResetPTPLock(self, false);
             }
-            spin_unlock((spinlock_t*)self->m_csPTPTime);
+            spin_unlock_irqrestore((spinlock_t*)self->m_csPTPTime, flags);
             self->m_wLastWatchDogSyncSequenceId = self->m_wLastSyncSequenceId;
             self->m_ui64LastWatchDogTime = ui64CurrentRTXClockTime;
         }
@@ -1070,17 +1076,18 @@ void timerProcess(TClock_PTP* self, uint64_t* pui64NextRTXClockTime, uint64_t ui
 ///////////////////////////////////////////////////////////////////////////////
 bool StartAudioFrameTICTimer(TClock_PTP* self, uint32_t ulFrameSize, uint32_t ulSamplingRate)
 {
+    unsigned long flags; // PREEMPT-fix: m_cs* lock taken in process + softirq ctx -> must irqsave
 	StopAudioFrameTICTimer(self);
 
 	// Atomicity
 	{
-        spin_lock((spinlock_t*)self->m_csPTPTime);
+        spin_lock_irqsave((spinlock_t*)self->m_csPTPTime, flags);
         self->m_ui32FrameSize = ulFrameSize;
         self->m_ui32SamplingRate = ulSamplingRate;
         self->m_bAudioFrameTICTimerStarted = true;
 		self->m_dTIC_CurrentPeriod = self->m_dTIC_BasePeriod = (self->m_ui32FrameSize * 1000000000000) / self->m_ui32SamplingRate; // [ps]
 		set_base_period(self->m_dTIC_BasePeriod/1000);
-		spin_unlock((spinlock_t*)self->m_csPTPTime);
+		spin_unlock_irqrestore((spinlock_t*)self->m_csPTPTime, flags);
 	}
 	MTAL_DP("[%u] StartAudioFrameTICTimer with...\n", self->m_pEth_netfilter->nic_id);
 	MTAL_DP("self->m_dTIC_BasePeriod = %llu	[ps]\n", self->m_dTIC_BasePeriod);
@@ -1193,7 +1200,7 @@ uint8_t GetPTPPriority(TClock_PTP* self)
 	memset(pPTPStats, 0, sizeof(TPTPStats));
 	{
         unsigned long flags;
-        spin_lock((spinlock_t*)self->m_csPTPTime);
+        spin_lock_irqsave((spinlock_t*)self->m_csPTPTime, flags);
 
 		pPTPStats->fPTPSyncRatio = self->m_pmmmPTPStatRatio.GetMax();
 		self->m_pmmmPTPStatRatio.ResetAtNextPoint();
@@ -1215,7 +1222,7 @@ uint8_t GetPTPPriority(TClock_PTP* self)
 		pPTPStats->i32PTPMaxDeltaTICFrame = self->m_pmmmPTPStatDeltaTICFrame.GetMax() / 10; // [us]
 		self->m_pmmmPTPStatDeltaTICFrame.ResetAtNextPoint();
 
-		spin_unlock((spinlock_t*)self->m_csPTPTime);
+		spin_unlock_irqrestore((spinlock_t*)self->m_csPTPTime, flags);
 	}
 }
 
@@ -1230,13 +1237,13 @@ void GetTICStats(TClock_PTP* self, TTICStats* pTICStats)
 	memset(pTICStats, 0, sizeof(TTICStats));
 	{
         unsigned long flags;
-        spin_lock((spinlock_t*)self->m_csPTPTime);
+        spin_lock_irqsave((spinlock_t*)self->m_csPTPTime, flags);
 
 		pTICStats->ui32TICMinDelta = (uint32_t)self->m_pmiTICInterval.GetMin(); // us
 		pTICStats->ui32TICMaxDelta = (uint32_t)self->m_pmiTICInterval.GetMax(); // [us]
 		self->m_pmiTICInterval.ResetAtNextPoint();
 
-		spin_unlock((spinlock_t*)self->m_csPTPTime);
+		spin_unlock_irqrestore((spinlock_t*)self->m_csPTPTime, flags);
 	}
 }*/
 
