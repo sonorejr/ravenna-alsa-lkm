@@ -247,14 +247,20 @@ int add_RTP_stream_(TRTP_streams_manager* self, TRTP_stream_info* pRTPStreamInfo
 		MTAL_DP("CRTP_streams_manager::add_RTP_stream: invalid IfPortId = %u\n", pRTPStreamInfo->m_uiIfPortId);
 		return 0;
 	}
+	// PREEMPT-fix: Create() -> rtp_stream_init() vmalloc's the stream buffer, a
+	// sleeping allocation that must NOT run while holding m_cs*RTPStreams (spinlock,
+	// irqs off). So: reserve a free slot UNDER the lock, Create() OUTSIDE the lock,
+	// then link the stream into the ordered list under the lock. Race-safe: the audio
+	// softirq (prepare_buffer_lives) walks ONLY the ordered list, populated after
+	// Create(); an Acquired-but-unlinked slot is invisible to it, and Acquire()
+	// (m_bActive=1) stops any other add from grabbing the same slot. Failure paths
+	// keep the original (slot-leaking) behaviour to avoid any other change.
 	if (pRTPStreamInfo->m_bSource)
 	{   // SOURCE
         int ret = 0;
-
-		All_LockSourceRPTStreams()
-
-        do {
         unsigned short us = 0;
+
+        { All_LockSourceRPTStreams()
         // find a free stream
         for (i = 0; i < MAX_SOURCE_STREAMS * self->m_usNumberOfNICS * 2; i++)
         {
@@ -265,25 +271,28 @@ int add_RTP_stream_(TRTP_streams_manager* self, TRTP_stream_info* pRTPStreamInfo
 				break;
 			}
 		}
+		All_UnlockSourceRPTStreams() }
+
 		if (!pUsableRTPStreamHandler)
 		{
 			MTAL_DP("CRTP_streams_manager::AddRTPStream: m_apRTPSourceStreams[0] has %d, %d, %d\n", self->m_apRTPSourceStreams[0].m_byNICId, self->m_apRTPSourceStreams[0].m_bActive, self->m_apRTPSourceStreams[0].m_nReaderCount);
 			MTAL_DP("CRTP_streams_manager::AddRTPStream: No empty slot (If port Id = %d)\n", pRTPStreamInfo->m_uiIfPortId);
-			break;
+			return 0;
 		}
         if (!Create(&pUsableRTPStreamHandler->m_RTPAudioStream, pRTPStreamInfo, self->m_pManager, self->m_pEth_netfilter[pRTPStreamInfo->m_uiIfPortId]))
 		{
 			MTAL_DP("CRTP_streams_manager::AddRTPStream: Failed to init RTPStream\n");
-			break;
+			return 0;
 		}
 
 		printk("CRTP_streams_manager::AddRTPStream: Add source %p on port Id = %d\n", pUsableRTPStreamHandler, pRTPStreamInfo->m_uiIfPortId);
 
+		{ All_LockSourceRPTStreams()
+		do {
 		if (self->m_usNumberOfNICS == 2)
 		{
 			MTAL_DP("CRTP_streams_manager::AddRTPStream: 2022-7 source attached\n");
-			// ST2022-7: search the stream which belongs with the same device stream (the one which is using the other NIC)		
-			// must be called before the stream is added in the ordered list
+			// ST2022-7: must be called before the stream is added in the ordered list
 			attached_stream(self, &pUsableRTPStreamHandler->m_RTPAudioStream.m_tRTPStream);
 		}
 
@@ -292,8 +301,6 @@ int add_RTP_stream_(TRTP_streams_manager* self, TRTP_stream_info* pRTPStreamInfo
             MTAL_DP("CRTP_streams_manager::AddRTPStream: error m_apRTPSourceOrderedStreams is full\n");
 			break;
 		}
-
-        ///$not double checked if the old algo match$ The list is sorted by number of channels (biggest to smallest). This is done to help Horus which doesn't like small stream especially when the number of samples per channel is big > 256
 
 		for (us = 0; us < self->m_usNumberOfRTPSourceStreams; us++)
 		{
@@ -318,18 +325,14 @@ int add_RTP_stream_(TRTP_streams_manager* self, TRTP_stream_info* pRTPStreamInfo
 
         ret = 1;
         } while (0);
-
-		All_UnlockSourceRPTStreams()
+		All_UnlockSourceRPTStreams() }
         return ret;
 	}
 	else
 	{   // SINK
-        int i;
         int ret = 0;
 
-		All_LockSinkRPTStreams()
-
-        do {
+        { All_LockSinkRPTStreams()
         // find a free stream
         for (i = 0; i < MAX_SINK_STREAMS * self->m_usNumberOfNICS * 2; i++)
         {
@@ -340,26 +343,28 @@ int add_RTP_stream_(TRTP_streams_manager* self, TRTP_stream_info* pRTPStreamInfo
 				break;
 			}
 		}
+		All_UnlockSinkRPTStreams() }
 
         if (!pUsableRTPStreamHandler)
 		{
             MTAL_DP("CRTP_streams_manager::AddRTPStream: No empty slot\n");
-            break;
+            return 0;
 		}
 
         if (!Create(&pUsableRTPStreamHandler->m_RTPAudioStream, pRTPStreamInfo, self->m_pManager, self->m_pEth_netfilter[pRTPStreamInfo->m_uiIfPortId]))
         {
             MTAL_DP("CRTP_streams_manager::AddRTPStream: Failed to init RTPStream\n");
-            break;
+            return 0;
 		}
 
 		printk("CRTP_streams_manager::AddRTPStream: Add sink %p on port Id = %d\n", pUsableRTPStreamHandler, pRTPStreamInfo->m_uiIfPortId);
 
+		{ All_LockSinkRPTStreams()
+		do {
 		if (self->m_usNumberOfNICS == 2)
 		{
 			MTAL_DP("CRTP_streams_manager::AddRTPStream: 2022-7 sink attached\n");
-			// ST2022-7: search the stream which belongs with the same device stream (the one which is using the other NIC)		
-			// must be called before the stream is added in the ordered list
+			// ST2022-7: must be called before the stream is added in the ordered list
 			attached_stream(self, &pUsableRTPStreamHandler->m_RTPAudioStream.m_tRTPStream);
 		}
 
@@ -374,8 +379,7 @@ int add_RTP_stream_(TRTP_streams_manager* self, TRTP_stream_info* pRTPStreamInfo
 
         ret = 1;
         } while (0);
-
-		All_UnlockSinkRPTStreams()
+		All_UnlockSinkRPTStreams() }
         return ret;
 	}
 	return 1;
