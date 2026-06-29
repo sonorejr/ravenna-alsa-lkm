@@ -202,8 +202,9 @@ int DestroyEtherTube(TEtherTubeNetfilter* self)
 ////////////////////////////////////////////////////////////////////////
 int Start(TEtherTubeNetfilter* self, const char *ifname)
 {
+    unsigned long flags; // PREEMPT-fix: netfilterLock_ taken in process(netlink)+softirq(nf rx) -> must irqsave
     int ret = 1;
-    spin_lock((spinlock_t*)self->netfilterLock_);
+    spin_lock_irqsave((spinlock_t*)self->netfilterLock_, flags);
 
     if (ifname)
     {
@@ -216,16 +217,17 @@ int Start(TEtherTubeNetfilter* self, const char *ifname)
         MTAL_DP_INFO("Start ifname=0\n");
         ret = 0;
     }
-    spin_unlock((spinlock_t*)self->netfilterLock_);
+    spin_unlock_irqrestore((spinlock_t*)self->netfilterLock_, flags);
     return ret;
 }
 
 ////////////////////////////////////////////////////////////////////////
 int Stop(TEtherTubeNetfilter* self)
 {
-    spin_lock((spinlock_t*)self->netfilterLock_);
+    unsigned long flags; // PREEMPT-fix: netfilterLock_ taken in process(netlink)+softirq(nf rx) -> must irqsave
+    spin_lock_irqsave((spinlock_t*)self->netfilterLock_, flags);
     self->started_ = 0;
-    spin_unlock((spinlock_t*)self->netfilterLock_);
+    spin_unlock_irqrestore((spinlock_t*)self->netfilterLock_, flags);
     return 1;
 }
 
@@ -245,8 +247,9 @@ void netfilter_hook_fct(TEtherTubeNetfilter* self, void* nf_hook_fct, void* nf_h
 
 int rx_packet(TEtherTubeNetfilter* self, void* packet, int packet_size, const char* ifname, int mac_header)
 {
+    unsigned long flags; // PREEMPT-fix: netfilterLock_ taken in process(netlink)+softirq(nf rx) -> must irqsave
     int ret = 0;
-    spin_lock((spinlock_t*)self->netfilterLock_);
+    spin_lock_irqsave((spinlock_t*)self->netfilterLock_, flags);
     do
     {
         if (!self->etherTubeEnable_ || !self->started_)
@@ -257,7 +260,7 @@ int rx_packet(TEtherTubeNetfilter* self, void* packet, int packet_size, const ch
         }
     }
     while (0);
-    spin_unlock((spinlock_t*)self->netfilterLock_);
+    spin_unlock_irqrestore((spinlock_t*)self->netfilterLock_, flags);
     if (ret == 1)
     {
         return 1;
