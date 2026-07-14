@@ -134,6 +134,11 @@ typedef struct
     uint64_t m_ui64PTPMaster_GMID;
     //######################################################
 
+    // local-clock-lock: when true, the media clock is syntonized to injected local
+    // PHC timestamps (InjectLocalPHC) instead of network PTP Sync, and process_PTP_packet
+    // ignores incoming PTP so a same-box ptp4l GM cannot be double-counted.
+    bool m_bLocalPHCLock;
+
 } TClock_PTP;
 
 
@@ -179,6 +184,12 @@ extern "C"
  //######################################################
 
  void ProcessT1(TClock_PTP* self, uint64_t ui64T1); // from Sync or Follow_up
+
+ // local-clock-lock (see PTP.c). SetLocalPHCLock toggles the mode; InjectLocalPHC
+ // feeds one tightly-paired {local-monotonic, PHC} sample (both in REF_UNIT) into the
+ // same syntonization path ProcessT1 uses -- PHC as the master (T1), mono as T2.
+ void SetLocalPHCLock(TClock_PTP* self, bool bEnable);
+ void InjectLocalPHC(TClock_PTP* self, uint64_t ui64Mono_ref, uint64_t ui64PHC_ref);
 
  bool SendDelayReq(TClock_PTP* self, TPTPV2MsgFollowUpPacket* pPTPV2MsgFollowUpPacket);
 

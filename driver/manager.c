@@ -805,6 +805,36 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             }
             break;
         }
+        case MT_ALSA_Msg_SetLocalPHCLock:   // local-clock-lock: enable/disable
+        {
+            if (msg_rcv->dataSize != sizeof(int))
+            {
+                MTAL_DP_ERR("SetLocalPHCLock invalid data size\n");
+                msg_reply.errCode = -315;
+            }
+            else
+            {
+                int enable = *(int*)msg_rcv->data;
+                SetLocalPHCLock(&self->m_PTP[self->m_Active_PTP_NIC_Idx], enable != 0);
+                msg_reply.errCode = 0;
+            }
+            return;  // fire-and-forget, NO reply (see note) -- do not fall to the common send
+        }
+        case MT_ALSA_Msg_InjectLocalPHC:    // local-clock-lock: one {mono_ref, phc_ref} sample
+        {
+            if (msg_rcv->dataSize != sizeof(struct Struct_InjectLocalPHC))
+            {
+                MTAL_DP_ERR("InjectLocalPHC invalid data size\n");
+                msg_reply.errCode = -315;
+            }
+            else
+            {
+                struct Struct_InjectLocalPHC* p = (struct Struct_InjectLocalPHC*)msg_rcv->data;
+                InjectLocalPHC(&self->m_PTP[self->m_Active_PTP_NIC_Idx], p->ui64Mono_ref, p->ui64PHC_ref);
+                msg_reply.errCode = 0;
+            }
+            return;  // fire-and-forget, NO reply (see note) -- do not fall to the common send
+        }
         case MT_ALSA_Msg_GetSampleRate:
         {
             //MTAL_DP(">>>> CManager::OnNewMessage MT_ALSA_Msg_GetSampleRate... return %u\n", self->m_SampleRate);

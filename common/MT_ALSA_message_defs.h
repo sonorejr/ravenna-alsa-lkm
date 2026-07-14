@@ -72,7 +72,17 @@ enum MT_ALSA_msg_id
     MT_ALSA_Msg_GetRTPStreamStatus,       //    U2K One input: hHandle, one output: the RTP stream status struct
     MT_ALSA_Msg_SetPTPConfig,             //    U2K One input: TPTPConfig
     MT_ALSA_Msg_GetPTPConfig,             //    U2K One output: TPTPConfig
-    MT_ALSA_Msg_GetPTPStatus              //    U2K One output: TPTPStatus
+    MT_ALSA_Msg_GetPTPStatus,             //    U2K One output: TPTPStatus
+    MT_ALSA_Msg_SetLocalPHCLock,          //    U2K: enable/disable local-clock-lock (int32 0/1)
+    MT_ALSA_Msg_InjectLocalPHC            //    U2K: inject Struct_InjectLocalPHC {mono_ref, phc_ref}; PHC plays the PTP-master role
+};
+
+// local-clock-lock payload: a tightly-paired local-monotonic / PHC timestamp, both
+// already scaled to the LKM REF_UNIT (nanoseconds / NS_2_REF_UNIT). See PTP.c InjectLocalPHC.
+struct Struct_InjectLocalPHC
+{
+    uint64_t ui64Mono_ref;   // local CLOCK_MONOTONIC (the RTX-clock / T2 domain)
+    uint64_t ui64PHC_ref;    // DAC-disciplined PHC     (the PTP-master / T1 domain)
 };
 
 struct MT_ALSA_msg

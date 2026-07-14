@@ -135,6 +135,8 @@ bool init_ptp(TClock_PTP* self, TEtherTubeNetfilter* pEth_netfilter, clock_ptp_o
 
 	self->m_usPTPLockCounter = PTP_LOCK_HYSTERESIS;
 
+	self->m_bLocalPHCLock = false;   // default off -> network-PTP slave behavior
+
 	self->m_uiTIC_DropCounter = 0;
 	self->m_uiTIC_LastDropCounter = 0;
 
@@ -234,6 +236,10 @@ EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketB
     TPTPPacketBase* pPTPPacketBase = (TPTPPacketBase*)pUDPPacketBase;
 	if(!self->m_bInitialized || !self->m_bAudioFrameTICTimerStarted)
 	{
+		return DR_PACKET_NOT_USED;
+	}
+	if(self->m_bLocalPHCLock)
+	{	// local-clock-lock: media clock comes from InjectLocalPHC; ignore network PTP
 		return DR_PACKET_NOT_USED;
 	}
 
@@ -737,6 +743,44 @@ void ProcessT1(TClock_PTP* self, uint64_t ui64T1)
 }
 
 ////////////////////////////////////////////////////////////////////
+// local-clock-lock: drive the media-clock recovery from the local (DAC-disciplined)
+// PHC instead of network PTP, so a DAC-clocked node can be its OWN grandmaster + AES67 sink,
+// past the same-box multicast-loopback wall (the LKM's ingress hook never sees a same-box
+// ptp4l's egress Sync). InjectLocalPHC mirrors the Sync path in process_PTP_packet: the
+// PHC time plays the PTP-master role (-> ProcessT1), the paired local-monotonic time is
+// the RTX-clock arrival (T2). Userspace timestamps the pair tightly so netlink latency
+// does not skew the DeltaT2/DeltaT1 syntonization ratio.
+void SetLocalPHCLock(TClock_PTP* self, bool bEnable)
+{
+	self->m_bLocalPHCLock = bEnable;
+	if (bEnable)
+	{
+		ResetPTPLock(self, true);   // restart the lock ramp against the new (local) reference
+		MTAL_DP("[%u] local-clock-lock ENABLED (media clock <- local PHC)\n", self->m_pEth_netfilter->nic_id);
+	}
+	else
+	{
+		MTAL_DP("[%u] local-clock-lock disabled (media clock <- network PTP)\n", self->m_pEth_netfilter->nic_id);
+	}
+}
+
+void InjectLocalPHC(TClock_PTP* self, uint64_t ui64Mono_ref, uint64_t ui64PHC_ref)
+{
+	if (!self->m_bLocalPHCLock)
+		return;   // ignore stray injects when not in local-lock mode
+	// Mirror the Sync handler's pre-ProcessT1 block: record the local arrival time (T2)
+	// + its RTX-clock snapshot under the PTP-time lock, then feed the PHC as master (T1).
+	{
+		spin_lock((spinlock_t*)self->m_csPTPTime);
+		self->m_ui64DeltaT2 = ui64Mono_ref - self->m_ui64T2;
+		self->m_ui64T2 = ui64Mono_ref;
+		self->m_ui64TIC_LastRTXClockTimeAtT2 = self->m_ui64TIC_LastRTXClockTime;
+		spin_unlock((spinlock_t*)self->m_csPTPTime);
+	}
+	ProcessT1(self, ui64PHC_ref);
+}
+
+////////////////////////////////////////////////////////////////////
 bool SendDelayReq(TClock_PTP* self, TPTPV2MsgFollowUpPacket* pPTPV2MsgFollowUpPacket)
 {
 	memcpy(&self->m_PTPV2MsgDelayReqPacket, pPTPV2MsgFollowUpPacket, sizeof(TPTPV2MsgFollowUpPacket));
@@ -989,7 +1033,10 @@ void timerProcess(TClock_PTP* self, uint64_t* pui64NextRTXClockTime, uint64_t ui
         if(ui64WatchDogElapse >= PTP_WATCHDOG_ELAPSE)
         {
             spin_lock_irqsave((spinlock_t*)self->m_csPTPTime, flags);
-            if(self->m_wLastWatchDogSyncSequenceId == self->m_wLastSyncSequenceId && GetLockStatus(self) != PTPLS_UNLOCKED)
+            // Local-PHC lock: injects are the sync source, so the network-sync watchdog must NOT
+            // reset the lock. m_wLastSyncSequenceId is frozen while process_PTP_packet is gated,
+            // so this would fire every PTP_WATCHDOG_ELAPSE (2s) and the media clock would flap.
+            if(!self->m_bLocalPHCLock && self->m_wLastWatchDogSyncSequenceId == self->m_wLastSyncSequenceId && GetLockStatus(self) != PTPLS_UNLOCKED)
             {
                 printk("[%u] PTP Master sync timeout, resetting ...\n", self->m_pEth_netfilter->nic_id);
 				MTAL_DP("[%u] Didn't received PTP sync since 2s\n", self->m_pEth_netfilter->nic_id);
