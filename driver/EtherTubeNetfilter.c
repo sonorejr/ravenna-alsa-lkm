@@ -37,6 +37,7 @@
 #include "MTAL_EthUtils.h"
 #include "MTAL_DP.h"
 #include "MTAL_TargetPlatform.h"
+#include <linux/moduleparam.h>
 
 #include <linux/spinlock.h>
 #include <linux/slab.h>
@@ -245,6 +246,14 @@ void netfilter_hook_fct(TEtherTubeNetfilter* self, void* nf_hook_fct, void* nf_h
     self->nf_hook_struct_ = nf_hook_struct;
 }
 
+// 2-box deploy: accept PTP on loopback so the source's OWN LKM can follow a local
+// ptp4l grandmaster (collapse the GM onto the source -> no dedicated GM box). Off by
+// default, so the normal external-GM (3-box) case does zero loopback processing.
+// Enable with: modprobe MergingRavennaALSA accept_lo=1
+static int accept_lo = 0;
+module_param(accept_lo, int, 0644);
+MODULE_PARM_DESC(accept_lo, "1 = also process PTP on loopback (lo) for a 2-box deploy with a local ptp4l GM (default 0)");
+
 int rx_packet(TEtherTubeNetfilter* self, void* packet, int packet_size, const char* ifname, int mac_header)
 {
     unsigned long flags; // PREEMPT-fix: netfilterLock_ taken in process(netlink)+softirq(nf rx) -> must irqsave
@@ -266,7 +275,8 @@ int rx_packet(TEtherTubeNetfilter* self, void* packet, int packet_size, const ch
         return 1;
     }
 
-    if (ifname == NULL || strcmp(ifname, self->ifname_used_) != 0)
+    if (ifname == NULL || (strcmp(ifname, self->ifname_used_) != 0
+                           && !(accept_lo && strcmp(ifname, "lo") == 0)))
     {
         //printk("2: %s, %s\n", ifname, self->ifname_used_);
         return 1;
