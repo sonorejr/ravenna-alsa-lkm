@@ -2180,7 +2180,7 @@ static int mr_alsa_audio_create_controls(   struct snd_card *card,
                                             struct mr_alsa_audio_chip *chip)
 {
     int err = 0;
-    spin_lock_irq(&chip->lock);
+    //PREEMPT-fix: spin_lock_irq(&chip->lock);
     chip->mr_alsa_audio_ops->get_master_volume_value(chip->ravenna_peer, (int)SNDRV_PCM_STREAM_PLAYBACK, &chip->current_playback_volume);
     chip->playback_volume_control = snd_ctl_new1(&mr_alsa_audio_ctrl_output_gain, chip);
     err = snd_ctl_add(card, chip->playback_volume_control);
@@ -2195,7 +2195,7 @@ static int mr_alsa_audio_create_controls(   struct snd_card *card,
         chip->playback_switch_control = snd_ctl_new1(&mr_alsa_audio_ctrl_output_switch, chip);
         err = snd_ctl_add(card, chip->playback_switch_control);
     }
-    spin_unlock_irq(&chip->lock);
+    //PREEMPT-fix: spin_unlock_irq(&chip->lock);
     return err;
 }
 
@@ -2216,7 +2216,7 @@ static int mr_alsa_audio_preallocate_memory(struct mr_alsa_audio_chip *chip)
     size_t wanted;
 
     pcm = chip->pcm;
-    wanted = mr_alsa_audio_pcm_hardware_playback.buffer_bytes_max * 4; // MR_ALSA_RINGBUFFER_NB_FRAMES * MR_ALSA_NB_CHANNELS_MAX * 4;
+    wanted = mr_alsa_audio_pcm_hardware_playback.buffer_bytes_max; /* ARM: was *4 (96MB) -> 32-bit vmalloc fail */ // MR_ALSA_RINGBUFFER_NB_FRAMES * MR_ALSA_NB_CHANNELS_MAX * 4;
 
     chip->playback_buffer = vmalloc(wanted);
     if(!chip->playback_buffer)
@@ -2228,7 +2228,7 @@ static int mr_alsa_audio_preallocate_memory(struct mr_alsa_audio_chip *chip)
     printk("mr_alsa_audio_preallocate_memory: allocated playback buffer of %zd bytes vmalloc requested\n", wanted);
     memset(chip->playback_buffer, 0, wanted);
 
-    wanted = mr_alsa_audio_pcm_hardware_capture.buffer_bytes_max * 4; // MR_ALSA_RINGBUFFER_NB_FRAMES * MR_ALSA_NB_CHANNELS_MAX * 4;
+    wanted = mr_alsa_audio_pcm_hardware_capture.buffer_bytes_max; /* ARM: was *4 (96MB) -> 32-bit vmalloc fail */ // MR_ALSA_RINGBUFFER_NB_FRAMES * MR_ALSA_NB_CHANNELS_MAX * 4;
 
     chip->capture_buffer = vmalloc(wanted);
     if(!chip->capture_buffer)
