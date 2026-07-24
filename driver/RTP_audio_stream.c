@@ -521,7 +521,13 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 
 	TRTP_stream_info* pRTP_stream_info = &self->m_tRTPStream.m_RTP_stream_info;
 	rtp_audio_stream_ops* pManager = self->m_pManager;
-	//TEtherTubeNetfilter* pEth_netfilter = self->m_tRTPStream.m_pEth_netfilter; //used for debug only
+	/* Restored 2026-07-23: this was commented out (presumably to silence an
+	   unused-variable warning once MTAL_DP became a no-op), which rotted every
+	   debug print below it -- they reference pEth_netfilter->nic_id and only fail
+	   to compile when the diagnostics are actually switched on (-DMTAL_DP_ENABLE).
+	   The (void) cast keeps it warning-free when those paths compile out. */
+	TEtherTubeNetfilter* pEth_netfilter = self->m_tRTPStream.m_pEth_netfilter; /* debug prints only */
+	(void)pEth_netfilter;
 	TRTP_stream* pAttachedStream;
 
 #ifdef DEBUG_CHECK
@@ -541,11 +547,11 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 
 	if(MTAL_SWAP32(pRTPPacketBase->IPV4Header.ui32DestIP) != pRTP_stream_info->m_ui32DestIP || MTAL_SWAP16(pRTPPacketBase->UDPHeader.usDestPort) != pRTP_stream_info->m_usDestPort)
 	{	// This RTP packet is not for this stream
-		//MTAL_DP("This RTP packet is not for this stream Dest IP ");
+		//MTAL_DP_PKT("This RTP packet is not for this stream Dest IP ");
 		//MTAL_DumpIPAddress(MTAL_SWAP32(pRTPPacketBase->IPV4Header.ui32DestIP), 0);
-		//MTAL_DP(" != ");
+		//MTAL_DP_PKT(" != ");
 		//MTAL_DumpIPAddress(pRTP_stream_info->m_ui32DestIP, 0);
-		//MTAL_DP(" Dest Port %d != %d\n", MTAL_SWAP16(pRTPPacketBase->UDPHeader.usDestPort), pRTP_stream_info->m_usDestPort);
+		//MTAL_DP_PKT(" Dest Port %d != %d\n", MTAL_SWAP16(pRTPPacketBase->UDPHeader.usDestPort), pRTP_stream_info->m_usDestPort);
 		return S_0;
 	}*/
 
@@ -556,13 +562,13 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 #ifdef DEBUG_CHECK
 	if(RTP_IS_PADDING(pRTPPacketBase->RTPHeader.byVersion)) // Padding
 	{
-		MTAL_DP("[%u] RTP packet with padding not supported\n", pEth_netfilter->nic_id);
+		MTAL_DP_PKT("[%u] RTP packet with padding not supported\n", pEth_netfilter->nic_id);
 		MTAL_RtTraceEvent(RTTRACEEVENT_RTP_IN, (PVOID)(RT_TRACE_EVENT_SIGNAL_STOP), 0);
 		return 0;
 	}
 	if(RTP_GET_VERSION(pRTPPacketBase->RTPHeader.byVersion) != 2) // 2.0
 	{
-		MTAL_DP("[%u] RTP packet with wrong version = 0x%x\n", pEth_netfilter->nic_id, RTP_GET_VERSION(pRTPPacketBase->RTPHeader.byVersion));
+		MTAL_DP_PKT("[%u] RTP packet with wrong version = 0x%x\n", pEth_netfilter->nic_id, RTP_GET_VERSION(pRTPPacketBase->RTPHeader.byVersion));
 		MTAL_RtTraceEvent(RTTRACEEVENT_RTP_IN, (PVOID)(RT_TRACE_EVENT_SIGNAL_STOP), 0);
 		return 0;
 	}
@@ -572,7 +578,7 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 		self->m_ui32WrongRTPPayloadTypeCounter++;
 
 		MTAL_DumpIPAddress(pRTP_stream_info->m_ui32DestIP, 0);
-		MTAL_DP("[%u] %s: RTP packet with wrong PayloadType = 0x%x\n", pEth_netfilter->nic_id, pRTP_stream_info->m_cName, pRTPPacketBase->RTPHeader.byPayloadType);
+		MTAL_DP_PKT("[%u] %s: RTP packet with wrong PayloadType = 0x%x\n", pEth_netfilter->nic_id, pRTP_stream_info->m_cName, pRTPPacketBase->RTPHeader.byPayloadType);
 		MTAL_RtTraceEvent(RTTRACEEVENT_RTP_IN, (PVOID)(RT_TRACE_EVENT_SIGNAL_STOP), 0);
 		return 0;
 	}
@@ -581,7 +587,7 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 	if(!pRTP_stream_info->m_bSSRCInitialized)
 	{
 		MTAL_DumpIPAddress(pRTP_stream_info->m_ui32DestIP, 0);
-		MTAL_DP("[%u] %s: SSRC = 0x%x\n", pEth_netfilter->nic_id, pRTP_stream_info->m_cName, MTAL_SWAP32(pRTPPacketBase->RTPHeader.ui32SSRC));
+		MTAL_DP_PKT("[%u] %s: SSRC = 0x%x\n", pEth_netfilter->nic_id, pRTP_stream_info->m_cName, MTAL_SWAP32(pRTPPacketBase->RTPHeader.ui32SSRC));
 		set_SSRC(pRTP_stream_info, MTAL_SWAP32(pRTPPacketBase->RTPHeader.ui32SSRC));
 	}
 	else if(pRTP_stream_info->m_ui32SSRC != MTAL_SWAP32(pRTPPacketBase->RTPHeader.ui32SSRC)
@@ -597,7 +603,7 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 		{
 			self->m_usWrongSSRCMessageCounter++;
 			MTAL_DumpIPAddress(pRTP_stream_info->m_ui32DestIP, 0);
-			MTAL_DP("[%u] %s: RTP packet with wrong SSRC. Attended: 0x%x received: 0x%x\n", pEth_netfilter->nic_id, pRTP_stream_info->m_cName, pRTP_stream_info->m_ui32SSRC, MTAL_SWAP32(pRTPPacketBase->RTPHeader.ui32SSRC));
+			MTAL_DP_PKT("[%u] %s: RTP packet with wrong SSRC. Attended: 0x%x received: 0x%x\n", pEth_netfilter->nic_id, pRTP_stream_info->m_cName, pRTP_stream_info->m_ui32SSRC, MTAL_SWAP32(pRTPPacketBase->RTPHeader.ui32SSRC));
 		}
 		return 0;
 	}
@@ -608,7 +614,7 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 		self->m_ui32WrongRTPSeqIdCounter++;
 
 		MTAL_DumpIPAddress(pRTP_stream_info->m_ui32DestIP, 0);
-		MTAL_DP("[%u] RTP packet with wrong SeqNum = %d should be %d\n", pEth_netfilter->nic_id, MTAL_SWAP16(pRTPPacketBase->RTPHeader.usSeqNum), self->m_tRTPStream.m_usIncomingSeqNum + 1);
+		MTAL_DP_PKT("[%u] RTP packet with wrong SeqNum = %d should be %d\n", pEth_netfilter->nic_id, MTAL_SWAP16(pRTPPacketBase->RTPHeader.usSeqNum), self->m_tRTPStream.m_usIncomingSeqNum + 1);
 	}
 	self->m_tRTPStream.m_usIncomingSeqNum = MTAL_SWAP16(pRTPPacketBase->RTPHeader.usSeqNum);
 
@@ -634,7 +640,7 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 	ui32NbOfSamplesInThisPacket = ui32RTPPayloadLength / (GetNbOfLivesIn(self) * pRTP_stream_info->m_byWordLength);
 	if(ui32NbOfSamplesInThisPacket == 0)
 	{
-		MTAL_DP("[%u] RTP packet with not enough audio data\n", pEth_netfilter->nic_id);
+		MTAL_DP_PKT("[%u] RTP packet with not enough audio data\n", pEth_netfilter->nic_id);
 		MTAL_RtTraceEvent(RTTRACEEVENT_RTP_IN, (PVOID)(RT_TRACE_EVENT_SIGNAL_STOP), 0);
 		return 0;
 	}
@@ -649,7 +655,7 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 		self->m_ui32WrongRTPSACCounter++;
 
 		MTAL_DumpIPAddress(pRTP_stream_info->m_ui32DestIP, 0);
-		MTAL_DP("[%u] %s: RTP packet with wrong SAC = %u should be %u, last size was: %u\n", pEth_netfilter->nic_id, pRTP_stream_info->m_cName, ui32RTPTimeStamp, self->m_tRTPStream.m_ui32LastRTPSAC + self->m_tRTPStream.m_ui32LastRTPLengthInSamples, self->m_tRTPStream.m_ui32LastRTPLengthInSamples);
+		MTAL_DP_PKT("[%u] %s: RTP packet with wrong SAC = %u should be %u, last size was: %u\n", pEth_netfilter->nic_id, pRTP_stream_info->m_cName, ui32RTPTimeStamp, self->m_tRTPStream.m_ui32LastRTPSAC + self->m_tRTPStream.m_ui32LastRTPLengthInSamples, self->m_tRTPStream.m_ui32LastRTPLengthInSamples);
 
 		// TODO: Mute: we should mute from [globalSAC to RTPTimeStamp - 1]
 		// The mute detection (IsLivesInMustBeMuted()) doesn't know if there was a gap before this current packet; so we have to fill the gap with mute.
@@ -666,7 +672,7 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 	/*if(self->m_pmiRTPArrivalTime.GetMax() > 1000) // 2ms
 	{
 		MTAL_DumpIPAddress(pRTP_stream_info->m_ui32DestIP, 0);
-		MTAL_DP(" %s: RTPArrivalTime > 2ms = %llu\n", pRTP_stream_info->m_cName, self->m_pmiRTPArrivalTime.GetMax());
+		MTAL_DP_PKT(" %s: RTPArrivalTime > 2ms = %llu\n", pRTP_stream_info->m_cName, self->m_pmiRTPArrivalTime.GetMax());
 	}*/
 
 #endif //DEBUG_CHECK
@@ -675,21 +681,21 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 	ui64GlobalSAC = pManager->get_global_SAC(pManager->user);
 	ui64RTPSAC = (ui64GlobalSAC & 0xFFFFFFFF00000000) | ui32RTPSAC;
 
-	//MTAL_DP("ui64RTPSAC = 0x%llx ui64GlobalSAC = 0x%llx\n", ui64RTPSAC, ui64GlobalSAC);
+	//MTAL_DP_PKT("ui64RTPSAC = 0x%llx ui64GlobalSAC = 0x%llx\n", ui64RTPSAC, ui64GlobalSAC);
 
 	// expand ui32Timestamp to 64 bits
 	if (ui32RTPSAC < 0x3FFFFFFFU && (uint32_t)ui64GlobalSAC >= 0xC0000000U) // 0xC0000000 = FFFFFFFF - 3FFFFFFF
 	{ // ui32RTPSAC wraps; we have to add 1 to 32 bits MSB
 		ui64RTPSAC += 0x100000000;
-		//MTAL_DP("0x%llx + 0x100000000\n", ui64RTPSAC);
+		//MTAL_DP_PKT("0x%llx + 0x100000000\n", ui64RTPSAC);
 	}
 	else if (ui32RTPSAC >= 0xC0000000U && (uint32_t)ui64GlobalSAC < 0x3FFFFFFFU) // 0xC0000000 = FFFFFFFF - 3FFFFFFF
 	{
 		// LSB of ui64GlobalSAC wraps; we have to sub 1 to 32 bits MSB
 		ui64RTPSAC -= 0x100000000;
-		//MTAL_DP("0x%llx - 0x100000000\n", ui64RTPSAC);
+		//MTAL_DP_PKT("0x%llx - 0x100000000\n", ui64RTPSAC);
 	}
-	//MTAL_DP("ui64RTPSAC = 0x%x", ui64RTPSAC);
+	//MTAL_DP_PKT("ui64RTPSAC = 0x%x", ui64RTPSAC);
 
 	ui64RTPSAC += pRTP_stream_info->m_ui32PlayOutDelay;
 
@@ -708,7 +714,7 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 	{
 		if (pAttachedStream->m_ui64LastAudioSampleReceivedSAC >= ui64LastAudioSampleReceivedSAC)
 		{ // no need to copy the audio; it was already done through the other NIC
-			//MTAL_DP("[%u] sink %s: Audio already arrived from other NIC; audio copy dropped (%llu <= %llu)\n", m_RTP_stream_info.GetIfPortId(), m_RTP_stream_info.GetName(), ui64LastAudioSampleReceivedSAC, pAttachedStream->GetLastAudioSampleReceivedSAC());
+			//MTAL_DP_PKT("[%u] sink %s: Audio already arrived from other NIC; audio copy dropped (%llu <= %llu)\n", m_RTP_stream_info.GetIfPortId(), m_RTP_stream_info.GetName(), ui64LastAudioSampleReceivedSAC, pAttachedStream->GetLastAudioSampleReceivedSAC());
 			bCopyRTPAudioToLivesIn = false;
 		}
 	}
@@ -728,10 +734,10 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 
 		MTAL_RtTraceEvent(RTTRACEEVENT_RTP_IN, (PVOID)(RT_TRACE_EVENT_SIGNAL_STOP), 0);
 
-		//MTAL_DP("ui32RTPSAC = %d Offset = %d, Len1 = %d Len2 = %d\n", ui32RTPSAC, ui32Offset, ui32Len1, ui32Len2);
-		//MTAL_DP("Global SAC %d\n", m_RTP_audio_stream_callback.get_global_SAC() % m_RTP_audio_stream_callback.get_live_jitter_buffer_length());
+		//MTAL_DP_PKT("ui32RTPSAC = %d Offset = %d, Len1 = %d Len2 = %d\n", ui32RTPSAC, ui32Offset, ui32Len1, ui32Len2);
+		//MTAL_DP_PKT("Global SAC %d\n", m_RTP_audio_stream_callback.get_global_SAC() % m_RTP_audio_stream_callback.get_live_jitter_buffer_length());
 
-		//MTAL_DP("Diff SAC RTP(%d) - GSAC(%llu) = %d\n", ui32RTPTimeStamp, m_RTP_audio_stream_callback.get_global_SAC(), ui32RTPTimeStamp - m_RTP_audio_stream_callback.get_global_SAC());
+		//MTAL_DP_PKT("Diff SAC RTP(%d) - GSAC(%llu) = %d\n", ui32RTPTimeStamp, m_RTP_audio_stream_callback.get_global_SAC(), ui32RTPTimeStamp - m_RTP_audio_stream_callback.get_global_SAC());
 
 		// Copy LiveIn Audio data
 
@@ -741,7 +747,7 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 		{
 			uint8_t* pbyRTPAudioBuffer = (uint8_t*)pui8RTPPayloadData;
 			self->m_pfnMTConvertInterleaveToMapped((void*)pbyRTPAudioBuffer, self->m_pvLivesInCircularBuffer, ui32Offset, pRTP_stream_info->m_byNbOfChannels, ui32Len1);
-			//MTAL_DP("0x%x, 0x%x, 0x%x, 0x%x, 0x%x\n", pbyRTPAudioBuffer[0], pbyRTPAudioBuffer[1], pbyRTPAudioBuffer[2], pbyRTPAudioBuffer[3]);
+			//MTAL_DP_PKT("0x%x, 0x%x, 0x%x, 0x%x, 0x%x\n", pbyRTPAudioBuffer[0], pbyRTPAudioBuffer[1], pbyRTPAudioBuffer[2], pbyRTPAudioBuffer[3]);
 		}
 		MTAL_RtTraceEvent(RTTRACEEVENT_RTP_IN, (PVOID)(RT_TRACE_EVENT_SIGNAL_STOP), 0);
 		MTAL_RtTraceEvent(RTTRACEEVENT_RTP_IN, (PVOID)(RT_TRACE_EVENT_SIGNAL_START | RT_TRACE_EVENT_COLOR_TURQUOISE), 0);
@@ -761,33 +767,33 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 		int64_t i64DeltaSAC;
 		uint32_t ui32MinSinkAheadTime;
 		pManager->get_global_times(pManager->user, &ui64GlobalSAC, &ui64GlobalTime, &ui64GlobalPerformanceCounter);
-		//MTAL_DP("GlobalSAC = %llu  GlobalTime= %llu  GlobalPerfmon = %llu\n", ui64GlobalSAC, ui64GlobalTime, ui64GlobalPerformanceCounter);
+		//MTAL_DP_PKT("GlobalSAC = %llu  GlobalTime= %llu  GlobalPerfmon = %llu\n", ui64GlobalSAC, ui64GlobalTime, ui64GlobalPerformanceCounter);
 
 		ui64GlobalPerformanceCounter = ui64GlobalPerformanceCounter * 1000000 / MTAL_LK_GetCounterFreq(); // convert to time
 
 		ui64Now = MTAL_LK_GetCounterTime() * 1000000 / MTAL_LK_GetCounterFreq();//MTAL_GetSystemTime();
 
 
-		//MTAL_DP("ui32RTPSAC %u  perfcounter %llu\n", ui32RTPSAC, MTAL_LK_GetCounterTime());
+		//MTAL_DP_PKT("ui32RTPSAC %u  perfcounter %llu\n", ui32RTPSAC, MTAL_LK_GetCounterTime());
 		// ui32UsedSAC is the first frame SAC when this packet will be used
 		ui64UsedSAC = (ui64RTPSAC - (CW_ll_modulo(ui64RTPSAC, pManager->get_frame_size(pManager->user))));
 
 		i64DeltaSAC =  ui64UsedSAC - ui64GlobalSAC;
-		//MTAL_DP("i64DeltaSAC %llu playout delay %u, frame size: %u\n", i64DeltaSAC, pRTP_stream_info->m_ui32PlayOutDelay, pManager->get_frame_size(pManager->user));
+		//MTAL_DP_PKT("i64DeltaSAC %llu playout delay %u, frame size: %u\n", i64DeltaSAC, pRTP_stream_info->m_ui32PlayOutDelay, pManager->get_frame_size(pManager->user));
 		if(i64DeltaSAC < 0)
 		{
 			i64DeltaSAC += 0x7FFFFFFFFFFFFFFF;
 		}
 
-		//MTAL_DP("2.i64DeltaSAC %llu\n", i64DeltaSAC);
+		//MTAL_DP_PKT("2.i64DeltaSAC %llu\n", i64DeltaSAC);
 
 		// ui64UsedTime is the time when the data will be used
 		ui64UsedTime = ui64GlobalPerformanceCounter + i64DeltaSAC * 10000000 / pRTP_stream_info->m_ui32SamplingRate;
 
 		ui32MinSinkAheadTime = (uint32_t)(ui64UsedTime - ui64Now);
 
-		//MTAL_DP("ui64Now %llu, ui64UsedTime %llu\n", ui64Now, ui64UsedTime);
-		//MTAL_DP("ui32MinSinkAheadTime %u\n", ui32MinSinkAheadTime);
+		//MTAL_DP_PKT("ui64Now %llu, ui64UsedTime %llu\n", ui64Now, ui64UsedTime);
+		//MTAL_DP_PKT("ui32MinSinkAheadTime %u\n", ui32MinSinkAheadTime);
 
 		// Reset min/max delta arrival time
 		if(self->m_ui32SinkAheadTimeResetCounter != self->m_ui32LastSinkAheadTimeResetCounter)
