@@ -361,6 +361,36 @@ void UpdateFrameSize(struct TManager* self)
     uint32_t ui32nFS;
     if(IsDSDRate(self->m_SampleRate))
     {
+        /* This multiplier is NOT free to choose: the resulting TIC frame size has to
+         * divide the ALSA ring exactly, or the interrupt handler walks off the DMA
+         * buffer.
+         *
+         * mr_alsa_audio_pcm_hw_params expects
+         *     nbPeriods * m_ui32FrameSize * (MR_ALSA_PTP_FRAME_RATE_FOR_DSD / alsa_rate)
+         *         == MR_ALSA_RINGBUFFER_NB_FRAMES
+         * and MR_ALSA_RINGBUFFER_NB_FRAMES is 48 * 64 * 16 = 49152 = 2^14 * 3. At DSD64
+         * (ALSA rate 88200) the interrupts-per-period factor is 352800/88200 = 4, so
+         * m_ui32FrameSize must divide 12288 = 2^12 * 3, i.e. ui32nFS must divide 256 --
+         * powers of two only.
+         *
+         * ui32nFS = 11 was tried (48 * 11 = 528 samples, chasing 176-sample RTP packets
+         * and a 24% lower packet rate). 528 does not divide 12288: ALSA still negotiated
+         * period_size 384 while the driver advanced by 528, and
+         * mr_alsa_audio_pcm_interrupt read one page past the end of the snd_dma buffer.
+         * Reproduced twice on armv7, both times fatal to the box (one Oops at
+         * mr_alsa_audio_pcm_interrupt, one silent hang caught by the watchdog). The
+         * driver's own "periodSize (384) differs from ptp_frame_size (528)" warning
+         * fires immediately before it.
+         *
+         * Consequence for packet rate: the RTP packet size is
+         * min(m_ui32MaxSamplesPerPacket, m_ui32FrameSize) with ceil(frame/max) packets
+         * per tic, so the rate is minimised when max_samples_per_packet divides the
+         * frame size. The largest divisor of 12288 that still fits
+         * RTP_MAX_PAYLOAD_SIZE at 2ch/32-bit (<= 182 samples) is 128, giving
+         * 352800/128 = ~2756 pkt/s. That is the floor for DSD64 while the ring is
+         * 2^14 * 3 frames; going lower means resizing MR_ALSA_RINGBUFFER_NB_FRAMES to a
+         * common multiple of the PCM and DSD frame sizes, not touching this multiplier.
+         */
         ui32nFS = 8;
     }
     else
