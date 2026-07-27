@@ -2219,6 +2219,33 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
 
     snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE, minPTPFrameSize);
 
+    /* buffer_size MUST be an exact multiple of period_size.
+     *
+     * Without this, ALSA is free to negotiate a fractional period count, and it did:
+     * period_size 384, periods 114, buffer_size 44112 -- but 114 * 384 = 43776. The
+     * driver noticed and warned ("bufferSize (44112) differs from expected (43776)")
+     * without enforcing anything.
+     *
+     * That matters because the interrupt handler wraps its DMA offset with
+     * `if (new_offset >= pcm_buffer_size) new_offset -= pcm_buffer_size`. With a buffer
+     * that is not a whole number of per-interrupt advances, the wrap lands mid-period
+     * (44112 = 459.5 advances of 96 frames at DSD64), so after every wrap the driver's
+     * position is offset from ALSA's period grid and frames repeat or are skipped.
+     * Measured at DSD64: ~0.28% of frames, plus skips of exactly 44113 = one buffer + 1.
+     *
+     * snd_pcm_hw_constraint_integer on PERIODS is the standard ALSA idiom for this and
+     * was simply missing. It forces buffer_size = periods * period_size, and since
+     * period_size is a multiple of the per-interrupt advance (period_size ==
+     * ptp_frame_size == nb * advance), the wrap then always lands exactly on 0.
+     * Applies to PCM and DSD alike -- PCM was equally exposed, just far less sensitive
+     * to a mid-buffer discontinuity than bit-exact DSD.
+     */
+    ret = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+    if (ret < 0) {
+        printk(KERN_ERR "mr_alsa_audio_pcm_open: cannot constrain PERIODS to integer\n");
+        return ret;
+    }
+
 #if 0
     ///rules Nb Periods by Rate
     snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_PERIODS,
