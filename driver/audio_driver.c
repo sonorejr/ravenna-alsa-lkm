@@ -759,29 +759,58 @@ static int mr_alsa_audio_pcm_interrupt(void *rawchip, int direction)
 
             bytes_to_frame_factor = runtime->channels * chip->current_alsa_playback_stride;
 
-            if (chip->playback_deinterleave_fn) {
-                chip->playback_deinterleave_fn(
-                    chip->playback_buffer,
-                    MR_ALSA_RINGBUFFER_NB_FRAMES,
-                    chip->playback_buffer_pos,
-                    chip->dma_playback_buffer + (uint32_t)atomic_read(&chip->dma_playback_offset),
-                    runtime->channels,
-                    ptp_frame_size);
-                chip->playback_buffer_alsa_sac += ptp_frame_size;
-            } else {
-                mr_alsa_audio_pcm_playback_copy_internal(
-                    sub, runtime->channels,
-                    chip->playback_buffer_pos,
-                    chip->dma_playback_buffer + (uint32_t)atomic_read(&chip->dma_playback_offset),
-                    ptp_frame_size);
-            }
-
+            /* How many ALSA frames this interrupt actually consumes.
+             *
+             * The de-interleave loop reads ONE ALSA frame per iteration and emits
+             * nb_playback_interrupts_per_period RAVENNA words from it (a DSD ALSA frame
+             * carries nb DSD bytes per channel). So to emit ptp_frame_size RAVENNA
+             * samples we must read ptp_frame_size / nb ALSA frames -- NOT ptp_frame_size.
+             *
+             * Passing ptp_frame_size made DSD playback consume the ALSA buffer nb times
+             * too fast and emit nb * ptp_frame_size RAVENNA samples per interrupt, so
+             * nb-1 of every nb frames were swallowed and never transmitted. Measured on
+             * hardware at DSD64 (nb = 4): the ALSA playback pointer advanced 354921
+             * frames/s instead of 88200 (4.02x), and a receiver capturing the stream got
+             * exactly 96 good frames then skipped 288 -- 1 frame in 4. Native DSD was
+             * therefore never bit-exact and played 4x fast.
+             *
+             * PCM is unaffected: nb is 1 there, so in_frames == ptp_frame_size exactly as
+             * before. This mirrors what the DSD capture path already does with out_frames.
+             */
             {
-                uint32_t new_offset = (uint32_t)atomic_read(&chip->dma_playback_offset)
-                                    + ptp_frame_size * bytes_to_frame_factor;
-                if (new_offset >= chip->pcm_playback_buffer_size)
-                    new_offset -= chip->pcm_playback_buffer_size;
-                atomic_set(&chip->dma_playback_offset, (int)new_offset);
+                unsigned int nb = chip->nb_playback_interrupts_per_period;
+                uint32_t in_frames = nb ? (ptp_frame_size / nb) : ptp_frame_size;
+
+                if (nb && (ptp_frame_size % nb))
+                    printk_ratelimited(KERN_WARNING
+                        "mr_alsa DSD playback: ptp_frame_size %u not a multiple of nb %u\n",
+                        ptp_frame_size, nb);
+
+                if (chip->playback_deinterleave_fn) {
+                    chip->playback_deinterleave_fn(
+                        chip->playback_buffer,
+                        MR_ALSA_RINGBUFFER_NB_FRAMES,
+                        chip->playback_buffer_pos,
+                        chip->dma_playback_buffer + (uint32_t)atomic_read(&chip->dma_playback_offset),
+                        runtime->channels,
+                        in_frames);
+                    chip->playback_buffer_alsa_sac += in_frames;
+                } else {
+                    /* copy_internal does playback_buffer_alsa_sac += count itself */
+                    mr_alsa_audio_pcm_playback_copy_internal(
+                        sub, runtime->channels,
+                        chip->playback_buffer_pos,
+                        chip->dma_playback_buffer + (uint32_t)atomic_read(&chip->dma_playback_offset),
+                        in_frames);
+                }
+
+                {
+                    uint32_t new_offset = (uint32_t)atomic_read(&chip->dma_playback_offset)
+                                        + in_frames * bytes_to_frame_factor;
+                    if (new_offset >= chip->pcm_playback_buffer_size)
+                        new_offset -= chip->pcm_playback_buffer_size;
+                    atomic_set(&chip->dma_playback_offset, (int)new_offset);
+                }
             }
 
             chip->playback_buffer_pos += ptp_frame_size;
@@ -1161,22 +1190,21 @@ static snd_pcm_uframes_t mr_alsa_audio_pcm_pointer(struct snd_pcm_substream *als
         unsigned long bytes_to_frame_factor = runtime->channels * chip->current_alsa_playback_stride;
         if (unlikely(bytes_to_frame_factor == 0))
             return 0;
+        /* No nb_playback_interrupts_per_period scaling here.
+         *
+         * This used to right-shift by log2(nb) to undo the interrupt handler advancing
+         * dma_playback_offset nb times too fast. That did not work: dma_playback_offset
+         * wraps at pcm_playback_buffer_size (the WHOLE ALSA buffer), so shifting the
+         * wrapped position aliases instead of compensating -- the reported pointer only
+         * ever covered buffer_size/nb, and ALSA read each early wrap as a full buffer
+         * wrap. At DSD64 that inflated the apparent rate to ~352800 frames/s against a
+         * true 88200 (measured 354921; predicted 352896 -- 0.6%).
+         *
+         * The advance is now correct at the source (in_frames = ptp_frame_size / nb in
+         * the interrupt handler), so the raw byte offset already maps 1:1 onto ALSA
+         * frames. PCM is unaffected: nb was 1, which hit `default:` and shifted nothing.
+         */
         offset = (uint32_t)atomic_read(&chip->dma_playback_offset) / bytes_to_frame_factor;
-
-        switch(chip->nb_playback_interrupts_per_period)
-        {
-            case 2:
-                offset >>= 1;
-                break;
-            case 4:
-                offset >>= 2;
-                break;
-            case 8:
-                offset >>= 3;
-                break;
-            default:
-                break;
-        }
     }
     else if(alsa_sub->stream == SNDRV_PCM_STREAM_CAPTURE)
     {
@@ -1184,22 +1212,13 @@ static snd_pcm_uframes_t mr_alsa_audio_pcm_pointer(struct snd_pcm_substream *als
         unsigned long bytes_to_frame_factor = runtime->channels * chip->current_alsa_capture_stride;
         if (unlikely(bytes_to_frame_factor == 0))
             return 0;
+        /* Same removal as playback, and on this side the shift had become an outright
+         * double-compensation: the DSD capture branch already advances
+         * dma_capture_offset by out_frames (= ptp_frame_size / nb), so shifting again
+         * scaled the reported pointer down by a further factor of nb. PCM unaffected
+         * (nb == 1 hit `default:`).
+         */
         offset = (uint32_t)atomic_read(&chip->dma_capture_offset) / bytes_to_frame_factor;
-
-        switch(chip->nb_capture_interrupts_per_period)
-        {
-            case 2:
-                offset >>= 1;
-                break;
-            case 4:
-                offset >>= 2;
-                break;
-            case 8:
-                offset >>= 3;
-                break;
-            default:
-                break;
-        }
     }
     return offset;
 }
