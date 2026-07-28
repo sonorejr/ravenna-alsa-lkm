@@ -766,16 +766,22 @@ void SetLocalPHCLock(TClock_PTP* self, bool bEnable)
 
 void InjectLocalPHC(TClock_PTP* self, uint64_t ui64Mono_ref, uint64_t ui64PHC_ref)
 {
+	unsigned long flags;
 	if (!self->m_bLocalPHCLock)
 		return;   // ignore stray injects when not in local-lock mode
 	// Mirror the Sync handler's pre-ProcessT1 block: record the local arrival time (T2)
 	// + its RTX-clock snapshot under the PTP-time lock, then feed the PHC as master (T1).
+	// MUST be irqsave: m_csPTPTime is also taken from the media-clock hrtimer tasklet
+	// (timerProcess, softirq context). A plain spin_lock here left softirqs enabled, so the
+	// media-clock softirq could fire on this CPU mid-critical-section and re-enter the same
+	// lock -> self-deadlock -> CPU hard-lockup (the DAC-master hang). lockdep flagged it as
+	// "inconsistent {IN-SOFTIRQ-W} -> {SOFTIRQ-ON-W}". Match every other m_csPTPTime acquirer.
 	{
-		spin_lock((spinlock_t*)self->m_csPTPTime);
+		spin_lock_irqsave((spinlock_t*)self->m_csPTPTime, flags);
 		self->m_ui64DeltaT2 = ui64Mono_ref - self->m_ui64T2;
 		self->m_ui64T2 = ui64Mono_ref;
 		self->m_ui64TIC_LastRTXClockTimeAtT2 = self->m_ui64TIC_LastRTXClockTime;
-		spin_unlock((spinlock_t*)self->m_csPTPTime);
+		spin_unlock_irqrestore((spinlock_t*)self->m_csPTPTime, flags);
 	}
 	ProcessT1(self, ui64PHC_ref);
 }
