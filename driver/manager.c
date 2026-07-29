@@ -361,6 +361,36 @@ void UpdateFrameSize(struct TManager* self)
     uint32_t ui32nFS;
     if(IsDSDRate(self->m_SampleRate))
     {
+        /* This multiplier is NOT free to choose: the resulting TIC frame size has to
+         * divide the ALSA ring exactly, or the interrupt handler walks off the DMA
+         * buffer.
+         *
+         * mr_alsa_audio_pcm_hw_params expects
+         *     nbPeriods * m_ui32FrameSize * (MR_ALSA_PTP_FRAME_RATE_FOR_DSD / alsa_rate)
+         *         == MR_ALSA_RINGBUFFER_NB_FRAMES
+         * and MR_ALSA_RINGBUFFER_NB_FRAMES is 48 * 64 * 16 = 49152 = 2^14 * 3. At DSD64
+         * (ALSA rate 88200) the interrupts-per-period factor is 352800/88200 = 4, so
+         * m_ui32FrameSize must divide 12288 = 2^12 * 3, i.e. ui32nFS must divide 256 --
+         * powers of two only.
+         *
+         * ui32nFS = 11 was tried (48 * 11 = 528 samples, chasing 176-sample RTP packets
+         * and a 24% lower packet rate). 528 does not divide 12288: ALSA still negotiated
+         * period_size 384 while the driver advanced by 528, and
+         * mr_alsa_audio_pcm_interrupt read one page past the end of the snd_dma buffer.
+         * Reproduced twice on armv7, both times fatal to the box (one Oops at
+         * mr_alsa_audio_pcm_interrupt, one silent hang caught by the watchdog). The
+         * driver's own "periodSize (384) differs from ptp_frame_size (528)" warning
+         * fires immediately before it.
+         *
+         * Consequence for packet rate: the RTP packet size is
+         * min(m_ui32MaxSamplesPerPacket, m_ui32FrameSize) with ceil(frame/max) packets
+         * per tic, so the rate is minimised when max_samples_per_packet divides the
+         * frame size. The largest divisor of 12288 that still fits
+         * RTP_MAX_PAYLOAD_SIZE at 2ch/32-bit (<= 182 samples) is 128, giving
+         * 352800/128 = ~2756 pkt/s. That is the floor for DSD64 while the ring is
+         * 2^14 * 3 frames; going lower means resizing MR_ALSA_RINGBUFFER_NB_FRAMES to a
+         * common multiple of the PCM and DSD frame sizes, not touching this multiplier.
+         */
         ui32nFS = 8;
     }
     else
@@ -1339,12 +1369,36 @@ void get_audio_engine_sample_format(void* user, enum EAudioEngineSampleFormat* p
     struct TManager* self = (struct TManager*)user;
     switch(GetAudioModeFromRate(self->m_SampleRate))
     {
+        /* Every case used to fall through to AESF_L32 (no breaks), so this function
+           ALWAYS reported PCM. That made the AESF_DSDInt{8,16,32}MSB1 branches of
+           CRTP_audio_stream::Init unreachable dead code, and since the SINK's
+           reachable AESF_L32 branch accepts only L16/L24/AM824, a DSD codec could
+           never be accepted on receive -- Add_RTPStream failed for EVERY codec at a
+           DSD rate (even plain AM824), which read like a codec/rate problem and was
+           not. Root-caused 2026-07-23.
+
+           AESF_DSDInt32MSB1 is the correct engine format for all DSD speeds here:
+           the RAVENNA side is ALWAYS 32-bit aligned ("Ravenna DSD always uses a rate
+           of 352k with eventual zero padding to maintain a 32 bit alignment" --
+           audio_driver.c). The ALSA-side container (DSD_U8/U16/U32) is a separate
+           concern handled by the copy/gather paths in audio_driver.c, so it does NOT
+           belong in this mapping.
+
+           Deliberately keeps get_audio_engine_sample_bytelength() at 4 (same as
+           AESF_L32), so live-in/out jitter-buffer striding and offsets are byte-for-byte
+           unchanged. Note the matching codec name is "DSD256" for DSD64/128/256 alike:
+           that name encodes the 32-bit CONTAINER, not the DSD speed (speed = the rate).
+           DSD512 is intentionally absent -- GetAudioModeFromRate() does not classify
+           22579200, so it falls to AM_PCM. */
         case AM_DSD64:
         case AM_DSD128:
         case AM_DSD256:
+            *pnSampleFormat = AESF_DSDInt32MSB1;
+            break;
         case AM_PCM:
         default:
             *pnSampleFormat = AESF_L32;
+            break;
     }
 }
 

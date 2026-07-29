@@ -129,8 +129,37 @@
             #include <linux/version.h>
             #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
                 #include <linux/kern_levels.h>
-                #define MTAL_DP(...)
-                //#define MTAL_DP(...) MTAL_LK_print(KERN_INFO __VA_ARGS__)
+                /* upstream compiles MTAL_DP out entirely. That silence is expensive:
+                   the driver's own failure diagnostics -- CRTP_audio_stream::Init's
+                   "invalid Codec %s" and "Unknown EAudioEngineSampleFormat (%i)", the
+                   "get_live_out_jitter_buffer(%u) not available" routing check -- never
+                   reach dmesg, so an Add_RTPStream rejection surfaces only as the daemon's
+                   generic "(driver) command failed" and has to be reverse-engineered from
+                   source (cost us most of 2026-07-23). Build with -DMTAL_DP_ENABLE to turn
+                   them on. It is CHATTY (MTAL_DP sits in packet-rate paths), so it is
+                   OPT-IN and must stay OFF for production images.
+                   e.g. make modules KCFLAGS=-DMTAL_DP_ENABLE */
+                #ifdef MTAL_DP_ENABLE
+                    #define MTAL_DP(...) MTAL_LK_print(KERN_INFO __VA_ARGS__)
+                #else
+                    #define MTAL_DP(...)
+                #endif
+                /* MTAL_DP_PKT: the SAME diagnostics, but for calls sitting in the
+                   per-PACKET path (ProcessRTPAudioPacket). Split out because those
+                   fire ~2-3k times/sec on a DSD stream: enabling them wedged a source
+                   box on 2026-07-23 -- it joins its own multicast group, so it
+                   received its own DSD stream and printk-stormed until userspace
+                   starved. They live in the same FILE as CRTP_audio_stream::Init's
+                   codec/engine-format messages, so a per-file CFLAGS switch cannot
+                   separate them -- hence a second macro. MTAL_DP_ENABLE therefore
+                   stays safe to enable everywhere (incl. a live receiver), while
+                   MTAL_DP_ENABLE_PKT is host-side debugging ONLY, never with a
+                   stream flowing. */
+                #ifdef MTAL_DP_ENABLE_PKT
+                    #define MTAL_DP_PKT(...) MTAL_LK_print(KERN_INFO __VA_ARGS__)
+                #else
+                    #define MTAL_DP_PKT(...)
+                #endif
                 #define MTAL_DP_EMRG(...) MTAL_LK_print(KERN_EMERG  __VA_ARGS__)
                 #define MTAL_DP_ALERT(...) MTAL_LK_print(KERN_ALERT __VA_ARGS__)
                 #define MTAL_DP_CRIT(...) MTAL_LK_print(KERN_CRIT __VA_ARGS__)
@@ -171,4 +200,12 @@
 		//#define MTAL_DPW
 	#endif
 #endif
+
+/* MTAL_DP_PKT is only given a real definition by the Linux-kernel branch above
+   (see the comment there). Every other platform branch falls back to a no-op so
+   the packet-path call sites in RTP_audio_stream.c still compile everywhere. */
+#ifndef MTAL_DP_PKT
+    #define MTAL_DP_PKT(...)
+#endif
+
 #endif // __MTAL_DP_H__
