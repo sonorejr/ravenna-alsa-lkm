@@ -1830,9 +1830,18 @@ static int mr_alsa_audio_pcm_hw_free(struct snd_pcm_substream *substream)
         struct mr_alsa_audio_chip *chip = snd_pcm_substream_chip(substream);
 
         printk(KERN_DEBUG "entering mr_alsa_audio_pcm_hw_free (substream name=%s #%d) ...\n", substream->name, substream->number);
-        spin_lock_irq(&chip->lock);
+        /* NO chip->lock here -- the exact mirror of the hw_params case above.
+           snd_pcm_lib_free_vmalloc_buffer() ends in vfree(), which may sleep, so taking
+           chip->lock (spin_lock_irq, i.e. IRQs off) around it trips
+           "BUG: sleeping function called from invalid context at mm/vmalloc.c" on any
+           kernel built with CONFIG_DEBUG_ATOMIC_SLEEP. Caught on the Fedora source box
+           2026-07-29, fired on every hw_free that actually released a buffer.
+           The lock was never needed: this touches only substream->runtime's dma buffer,
+           not the chip state chip->lock guards, and ALSA already serialises hw_free
+           against hw_params under runtime->buffer_mutex (visible as lock #0 in that
+           splat). Dropping it is the fix, not moving it. */
+        (void)chip;
         err = snd_pcm_lib_free_vmalloc_buffer(substream);
-        spin_unlock_irq(&chip->lock);
     }
     return err;
 }
