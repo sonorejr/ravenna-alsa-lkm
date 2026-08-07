@@ -1858,7 +1858,10 @@ static struct snd_pcm_hw_constraint_list g_constraints_rates = {
                 .mask = 0,
 };
 
-static unsigned int g_supported_period_sizes[] = {
+/* Filled in at open by mr_alsa_audio_pcm_open: the 9 AES67 base sizes scaled by each of the
+ * 4 rate factors (1/2/4/8), deduplicated and filtered to the driver's frame-size window --
+ * so at most 9*4 entries. Sized for the worst case; .count is set to what actually fits. */
+static unsigned int g_supported_period_sizes[9 * 4] = {
     6, 12, 16, 48, 64, 128, 192, 384, 512
 };
 static struct snd_pcm_hw_constraint_list g_constraints_period_sizes = {
@@ -2198,18 +2201,64 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
     /// Update the Period Sizes Static array accordingly
     {
         static const unsigned int aes67_base_sizes[] = {6, 12, 16, 48, 64, 128, 192, 384, 512};
-        unsigned int sr_factor = mr_alsa_audio_get_samplerate_factor(chip->current_rate);
+        /* Scale factors for every rate family we advertise: 1x (44.1/48), 2x (88.2/96),
+         * 4x (176.4/192), 8x (352.8/384). */
+        static const unsigned int sr_factors[] = {1, 2, 4, 8};
         unsigned int count = 0;
+        unsigned int f;
 
-        for (idx = 0; idx < ARRAY_SIZE(aes67_base_sizes); ++idx) {
-            unsigned int scaled = aes67_base_sizes[idx] * sr_factor;
-            if (scaled >= minPTPFrameSize && scaled <= maxPTPFrameSize) {
+        /* This list MUST cover every rate the client may ask for, not just the rate the card
+         * happens to be at right now.
+         *
+         * It used to be built from chip->current_rate alone. That silently broke rate CHANGES:
+         * the list was fixed at open for the OLD rate, while hw_rule_period_size_by_rate below
+         * refines PERIOD_SIZE to [min*sr_factor, max*sr_factor] for the REQUESTED rate. When the
+         * two describe different rate families their intersection can be empty, and the open
+         * fails with EINVAL from whichever parameter the client set last -- for MPD that surfaces
+         * as snd_pcm_hw_params_set_buffer_time_near(): Invalid argument, and the stream never
+         * starts.
+         *
+         * The failure was DIRECTIONAL, which is what gave it away: going up (44.1 -> 96, factor
+         * 1 -> 2) still worked because the small unscaled entries fall inside the wider interval,
+         * while going down (96 -> 44.1, factor 2 -> 1) failed because every entry had been scaled
+         * up out of the narrower one. Measured on a sonicTransporter: 9 of 10 switches into
+         * 44.1 kHz failed, 0 of 10 into 96 kHz.
+         *
+         * Listing all factors keeps the list rate-independent; the hw_rule then narrows it to the
+         * correct interval for whatever rate is actually being negotiated. Entries outside the
+         * driver's own [minPTPFrameSize, maxPTPFrameSize] window are still filtered out, and
+         * duplicates are skipped so the list stays a proper set.
+         */
+        for (f = 0; f < ARRAY_SIZE(sr_factors); ++f) {
+            for (idx = 0; idx < ARRAY_SIZE(aes67_base_sizes); ++idx) {
+                unsigned int scaled = aes67_base_sizes[idx] * sr_factors[f];
+                unsigned int j;
+                if (scaled < minPTPFrameSize || scaled > maxPTPFrameSize)
+                    continue;
+                if (count >= ARRAY_SIZE(g_supported_period_sizes))
+                    break;
+                for (j = 0; j < count; ++j)
+                    if (g_supported_period_sizes[j] == scaled)
+                        break;
+                if (j < count)
+                    continue;               /* already listed */
                 g_supported_period_sizes[count++] = scaled;
             }
         }
         if (count == 0) {
-            g_supported_period_sizes[0] = minPTPFrameSize * sr_factor;
+            g_supported_period_sizes[0] = minPTPFrameSize;
             count = 1;
+        }
+        /* snd_pcm_hw_constraint_list requires an ascending list. */
+        {
+            unsigned int a, b, tmp;
+            for (a = 0; a + 1 < count; ++a)
+                for (b = a + 1; b < count; ++b)
+                    if (g_supported_period_sizes[b] < g_supported_period_sizes[a]) {
+                        tmp = g_supported_period_sizes[a];
+                        g_supported_period_sizes[a] = g_supported_period_sizes[b];
+                        g_supported_period_sizes[b] = tmp;
+                    }
         }
         g_constraints_period_sizes.count = count;
     }
