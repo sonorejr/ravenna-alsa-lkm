@@ -491,34 +491,104 @@ bool SetInterfaceName(struct TManager* self, const char* cInterfaceName, const i
 /// Gating on m_Is_NIC_Active lets the wait end at the real relock, and counting TIME
 /// makes the fallback timeout mean what it says on any HZ.
 ///
-/// Returns true if every active instance locked, false on timeout.
+/// True when every ACTIVE PTP instance reports lock. m_PTP[] is sized _MAX_NICS for the
+/// dual-NIC (ST2022-7) case, but init sets m_Is_NIC_Active[1] = false and only NIC 0 is ever
+/// attached here, so m_PTP[1] never leaves PTPLS_UNLOCKED and must not be required.
+static bool AllActivePTPLocked(struct TManager* self)
+{
+    int i;
+
+    for (i = 0; i < _MAX_NICS; i++)
+    {
+        if (!self->m_Is_NIC_Active[i])
+            continue;
+        if (GetLockStatus(&self->m_PTP[i]) != PTPLS_LOCKED)
+            return false;
+    }
+    return true;
+}
+
+/// ⚠ PCM ONLY. The DSD path must keep WaitForPTPLockLegacy() below — see the warning there.
+///
+/// Wait for the media clock to RE-LOCK after a rate change — i.e. observe the transition,
+/// not the level.
+///
+/// The subtlety that broke two earlier attempts: StartAudioFrameTICTimer() triggers a PTP
+/// reset, but GetLockStatus() keeps returning PTPLS_LOCKED for a short window afterwards.
+/// A wait that samples the lock immediately therefore sees a STALE lock, returns at once, and
+/// lets audio start before the clock has adopted the new rate — playback then runs at the OLD
+/// rate (measured: DSD64 at 0.14x = 48000/352800; PCM after DSD draining 8x too fast). The
+/// original 4000-iteration loop never hit this only because it required m_PTP[1], which never
+/// locks, so it always slept ~32 s — long enough for reset and re-acquire. The bug and the
+/// workaround were the same line, which is why "just make it exit early" is wrong.
+///
+/// So: first wait (briefly) for the lock to DROP, then for it to come back. If it never drops
+/// the clock did not need to re-rate and there is nothing to wait for, so return success.
+///
+/// Returns true once re-locked (or if no re-rate happened), false on timeout.
 static bool WaitForPTPLock(struct TManager* self)
 {
-    /* Same budget the iteration counter was aiming for. */
-    const unsigned long deadline = jiffies + msecs_to_jiffies(PTP_LOCK_WAIT_MS);
+    const unsigned long drop_deadline = jiffies + msecs_to_jiffies(PTP_LOCK_DROP_WAIT_MS);
+    unsigned long relock_deadline;
 
-    for (;;)
+    /* Phase 1: let the reset become visible. Bounded and short — a rate change that does not
+       disturb the clock (same rate, or IO not running) simply never drops. */
+    while (AllActivePTPLocked(self))
     {
-        int i;
-        bool all_locked = true;
+        if (time_after(jiffies, drop_deadline))
+            return true;            /* never dropped -> no re-rate in flight */
+        CW_msleep_interruptible(1);
+    }
 
-        for (i = 0; i < _MAX_NICS; i++)
-        {
-            if (!self->m_Is_NIC_Active[i])
-                continue;
-            if (GetLockStatus(&self->m_PTP[i]) != PTPLS_LOCKED)
-            {
-                all_locked = false;
-                break;
-            }
-        }
-
-        if (all_locked)         /* also the no-active-NIC case: nothing to wait for */
-            return true;
-        if (time_after(jiffies, deadline))
+    /* Phase 2: the clock is re-acquiring at the new rate. THIS is the wait that matters. */
+    relock_deadline = jiffies + msecs_to_jiffies(PTP_LOCK_WAIT_MS);
+    while (!AllActivePTPLocked(self))
+    {
+        if (time_after(jiffies, relock_deadline))
             return false;
         CW_msleep_interruptible(1);
     }
+    return true;
+}
+
+//////////////////////////////////////////////////////////////////////////////////
+/// The ORIGINAL wait, kept deliberately for the DSD path. Do not "fix" this one.
+///
+/// 🛑 Replacing this with WaitForPTPLock() above BREAKS DSD PLAYBACK. Measured on hardware
+/// 2026-08-08 (imx6, DSD64 via MPD -> RAVENNA source, A/B on one box, one variable):
+///     shipped/legacy wait : 1.00x realtime   (correct)
+///     WaitForPTPLock()    : 0.14x realtime   (audible as "stuck", stretched music)
+/// 0.14 is exactly 48000/352800 — the 48 kHz baseline over the DSD_U8 frame rate.
+///
+/// The mechanism is NOT understood yet, and two plausible explanations were tested and
+/// REFUTED, so don't re-derive them:
+///   * the TIC is not left stale — the kernel log shows "base period set to 136054 ns"
+///     (= 48/352800), i.e. the timer really is running at the DSD rate; and
+///   * the bool return is not load-bearing — both callers (OnNewMessage, below) ignore it.
+/// What remains is a timing race that this loop's accidental ~32 s stall used to serialise.
+/// Note SetDSDSamplingRate() silently refuses while m_bIORunning, and its MTAL_DP diagnostic
+/// is invisible in production builds (needs MTAL_DP_ENABLE=1 at compile time), so a refused
+/// DSD rate change leaves no trace in dmesg.
+///
+/// Until someone instruments that race, DSD keeps the slow-but-correct wait. It costs a rate
+/// change into/out of DSD ~32 s, which is bad but SILENT-CORRECT; the alternative is fast and
+/// audibly wrong. PCM — the path Roon actually skips tracks on — gets the fast wait.
+///
+/// Returns true on lock, false on timeout, with the original iteration-counted budget.
+static bool WaitForPTPLockLegacy(struct TManager* self)
+{
+    uint64_t nbloop = 0;
+
+    do
+    {
+        CW_msleep_interruptible(1);
+        if(++nbloop >= 4000)
+            return false;
+    }
+    while (GetLockStatus(&self->m_PTP[0]) != PTPLS_LOCKED ||
+           GetLockStatus(&self->m_PTP[1]) != PTPLS_LOCKED);
+
+    return true;
 }
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -592,9 +662,11 @@ bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
             }
         }
         start_clock_timer();
-        if(!WaitForPTPLock(self))
+        /* DSD deliberately keeps the LEGACY wait -- the fast one makes DSD play at 0.14x.
+           See the warning on WaitForPTPLockLegacy(). */
+        if(!WaitForPTPLockLegacy(self))
         {
-            MTAL_DP("CManager::SetSamplingRate PTP lock timed out\n");
+            MTAL_DP("CManager::SetDSDSamplingRate PTP lock timed out\n");
             return false;
         }
         //MTAL_DP("\n>>> CManager::SetSamplingRate completed () (self->m_PTP.GetLockStatus() == PTPLS_LOCKED)\n\n");
@@ -1820,6 +1892,21 @@ int set_sample_rate(void* user, uint32_t rate)
     {
         if(IsStarted(self))
         {
+            /* THIS FUNCTION IS ON THE DSD PATH TOO: mr_alsa_audio_pcm_prepare calls it with
+               runtime_dsd_rate (audio_driver.c) when the DSD mode changes. The fast wait makes
+               DSD play at 0.14x (see WaitForPTPLockLegacy), so branch on the rate and give DSD
+               the original behaviour, byte for byte, including returning 0 on timeout. */
+            if(IsDSDRate(rate))
+            {
+                if(!WaitForPTPLockLegacy(self))
+                {
+                    MTAL_DP("CManager::set_sample_rate PTP lock timed out (DSD)\n");
+                    return 0;   /* the original `return false` in an int function -- keep it 0 */
+                }
+                MTAL_DP("CManager::set_sample_rate completed (DSD)\n");
+                return 0;
+            }
+
             /* A wait for THIS rate already ran its full budget and failed. Waiting again
                cannot know anything the first one did not; the request above has been
                re-sent, so let the ALSA layer get on with it. */

@@ -53,10 +53,18 @@
 
 #define MAX_INTERFACE_NAME 64
 
-/// How long a sample-rate change waits for both PTP instances to re-lock, in MILLISECONDS.
-/// This is the budget the old 4000-iteration counter was aiming for; it is expressed in time
-/// now because the loop's real cost was HZ-dependent (see WaitForPTPLock in manager.c).
-#define PTP_LOCK_WAIT_MS 4000
+/// How long a sample-rate change waits for the media clock to RE-LOCK, in MILLISECONDS.
+/// Expressed in time because the old 4000-iteration counter was HZ-dependent (~32 s at
+/// CONFIG_HZ=250, not the 4 s it looks like). 12 s, not the old nominal 4 s: a real re-lock
+/// after a rate change measures ~8 s on imx6 (PTP lock 2->0->1->2), so 4 s would time out on
+/// every change. Must stay UNDER Roon's 15 s prepare timeout, which is the whole point.
+#define PTP_LOCK_WAIT_MS 12000
+
+/// How long to wait for the PTP reset triggered by StartAudioFrameTICTimer() to become
+/// VISIBLE (lock drops) before concluding no re-rate is in flight. The reset shows up within
+/// ~26 ms in practice; 500 ms is slack. See WaitForPTPLock() for why sampling the lock level
+/// instead of the transition silently corrupts playback rate.
+#define PTP_LOCK_DROP_WAIT_MS 500
 
 #ifndef nullptr
     #define nullptr NULL
