@@ -32,6 +32,10 @@
 #include "manager.h"
 #include "EtherTubeNetfilter.h"
 #include <linux/errno.h>
+/// jiffies / time_after / msecs_to_jiffies for WaitForPTPLock's time-based timeout. Included
+/// explicitly rather than relied on transitively — this file only pulled them in by accident
+/// of another header, and that is not something to build a timeout on.
+#include <linux/jiffies.h>
 
 #include "RTP_stream_info.h"
 
@@ -149,6 +153,7 @@ bool init(struct TManager* self, int* errorCode)
 
     //  initialize the stuff tracked by the IORegistry
     self->m_SampleRate = DEFAULT_SAMPLERATE;
+    self->m_RateWaitTimedOutFor = 0;
     SetSamplingRate(self, self->m_SampleRate);
 
     self->m_TICFrameSizeAt1FS = DEFAULT_NADAC_TICFRAMESIZE;
@@ -462,10 +467,64 @@ bool SetInterfaceName(struct TManager* self, const char* cInterfaceName, const i
 }
 
 //////////////////////////////////////////////////////////////////////////////////
+/// Wait for the ACTIVE PTP instances to reach lock, or give up after PTP_LOCK_WAIT_MS.
+///
+/// Replaces three copies of a do/while that waited on BOTH m_PTP[0] and m_PTP[1] while
+/// counting 4000 iterations of CW_msleep_interruptible(1) and calling that "4 seconds".
+/// Two separate bugs were stacked there:
+///
+/// 1. THE WAIT WAS UNSATISFIABLE ON A SINGLE-NIC BOX (the real cost). m_PTP[] is sized
+///    _MAX_NICS for the dual-NIC (ST2022-7) case, but init sets m_Is_NIC_Active[1] =
+///    false and only NIC 0 is ever attached, so m_PTP[1] receives no PTP packets and can
+///    never leave PTPLS_UNLOCKED. Requiring BOTH therefore meant the loop could not exit
+///    early *by design* — it ran to the timeout on every single rate change, no matter
+///    how fast the media clock actually relocked. Every other per-NIC loop in this file
+///    already gates on m_Is_NIC_Active (see StartAudioFrameTICTimer /
+///    StopAudioFrameTICTimer / the packet dispatch); this one did not. Measured on
+///    hardware 2026-08-07: PTP [0] relocked 7.9s after a 44.1k -> 88.2k change, but
+///    hw_params did not return for 33s — i.e. the full timeout, not the lock.
+///
+/// 2. The timeout was counted in ITERATIONS, not time. msleep() cannot sleep less than a
+///    jiffy, so at CONFIG_HZ=250 (these images) each iteration costs ~8ms and the
+///    intended 4s became ~32s — paid up to 3x per rate change (~96s of a ~103s switch).
+///
+/// Gating on m_Is_NIC_Active lets the wait end at the real relock, and counting TIME
+/// makes the fallback timeout mean what it says on any HZ.
+///
+/// Returns true if every active instance locked, false on timeout.
+static bool WaitForPTPLock(struct TManager* self)
+{
+    /* Same budget the iteration counter was aiming for. */
+    const unsigned long deadline = jiffies + msecs_to_jiffies(PTP_LOCK_WAIT_MS);
+
+    for (;;)
+    {
+        int i;
+        bool all_locked = true;
+
+        for (i = 0; i < _MAX_NICS; i++)
+        {
+            if (!self->m_Is_NIC_Active[i])
+                continue;
+            if (GetLockStatus(&self->m_PTP[i]) != PTPLS_LOCKED)
+            {
+                all_locked = false;
+                break;
+            }
+        }
+
+        if (all_locked)         /* also the no-active-NIC case: nothing to wait for */
+            return true;
+        if (time_after(jiffies, deadline))
+            return false;
+        CW_msleep_interruptible(1);
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////////
 bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
 {
     int i;
-    uint64_t nbloop = 0;
     //MTAL_DP("CManager::SetSamplingRate from %u to %u\n", self->m_SampleRate, samplingRate);
 
     if(self->m_SampleRate == samplingRate)
@@ -492,16 +551,11 @@ bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
             }
         }
         start_clock_timer();
-        do
+        if(!WaitForPTPLock(self))
         {
-            CW_msleep_interruptible(1);
-            if(++nbloop >= 4000)
-            {
-                MTAL_DP("CManager::SetSamplingRate PTP lock timed out\n");
-                return false;
-            }
+            MTAL_DP("CManager::SetSamplingRate PTP lock timed out\n");
+            return false;
         }
-        while (GetLockStatus(&self->m_PTP[0]) != PTPLS_LOCKED || GetLockStatus(&self->m_PTP[1]) != PTPLS_LOCKED);
         //MTAL_DP("CManager::SetSamplingRate(%u) Completed\n", samplingRate);
     }
 
@@ -512,7 +566,6 @@ bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
 bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
 {
     int i = 0;
-    uint64_t nbloop = 0;
     MTAL_DP("CManager::SetDSDSamplingRate(%u)\n", samplingRate);
 
     if(self->m_SampleRate == samplingRate)
@@ -539,16 +592,11 @@ bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
             }
         }
         start_clock_timer();
-        do
+        if(!WaitForPTPLock(self))
         {
-            CW_msleep_interruptible(1);
-            if(++nbloop >= 4000)
-            {
-                MTAL_DP("CManager::SetSamplingRate PTP lock timed out\n");
-                return false;
-            }
+            MTAL_DP("CManager::SetSamplingRate PTP lock timed out\n");
+            return false;
         }
-        while (GetLockStatus(&self->m_PTP[0]) != PTPLS_LOCKED || GetLockStatus(&self->m_PTP[1]) != PTPLS_LOCKED);
         //MTAL_DP("\n>>> CManager::SetSamplingRate completed () (self->m_PTP.GetLockStatus() == PTPLS_LOCKED)\n\n");
     }
     return true;
@@ -1720,11 +1768,44 @@ int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa
 /// called from alsa driver
 /// effective change will be done by SetSampleRate once manger has received MT_ALSA_Msg_SetSampleRate message from daemon
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// Ask user land to change the sample rate, then wait for the PTP media clock to re-lock.
+///
+/// The ALSA layer calls this up to THREE times for one rate change — once from
+/// mr_alsa_audio_pcm_hw_params and twice from mr_alsa_audio_pcm_prepare — because each site
+/// guards only on the rate the peer currently reports, and a change that has not taken effect
+/// still reports the old one. When the wait times out, all three pay it in full.
+///
+/// Measured on hardware before this change (imx6, CONFIG_HZ=250, 44.1k -> 88.2k):
+///   3 x 32.0s inside the driver, 96s of a 103s user-visible rate change.
+/// The 32s was the old timeout (see WaitForPTPLock, which used to be unsatisfiable on a
+/// single-NIC box and so ALWAYS ran to it); the x3 is this.
+///
+/// With the active-NIC gate in WaitForPTPLock the first wait now ends at the real relock,
+/// and the 2nd/3rd calls find the clock already locked and return immediately — so this
+/// skip is no longer the main saving. It is kept as the belt-and-braces path for a genuine
+/// timeout (clock really is gone): remember the rate whose wait just ran its full budget
+/// and, while that is still the rate being asked for, skip the redundant waits. The request
+/// is STILL sent to user land each time — it is cheap, and re-sending is what lets a late
+/// lock take effect — only the second and third sleeps are dropped.
+///
+/// Returns 0 when the rate was applied, and also 0 when the PTP wait timed out; -EPIPE only
+/// if the request could not be sent at all.
+///
+/// ⚠ A TIMEOUT MUST KEEP RETURNING 0. The original code said `return false` here, which in an
+/// int-returning function is 0 — the same value as success — and every caller was built on
+/// that. Returning a real error instead was tried on hardware (2026-08-07) and broke the
+/// receiver outright: mr_alsa_audio_pcm_hw_params propagates the value, so the bridge failed
+/// at hw_params on every attempt, never reached trigger(Start), and systemd restart-looped it
+/// 22 times with no audio at all. The DAC changed rate and then sat silent.
+///
+/// So the honest error stays OUT of the return value and lives in m_RateWaitTimedOutFor
+/// instead: the redundant waits are skipped, the caller's control flow is untouched, and a
+/// slow rate change stays slow rather than becoming a broken one. Making a timeout fatal is a
+/// separate change that has to fix audio_driver.c's error handling first.
 int set_sample_rate(void* user, uint32_t rate)
 {
     struct TManager* self = (struct TManager*)user;
     int err = 0;
-    int nbloop = 0;
 
     struct MT_ALSA_msg msgSent;
     MTAL_DP("CManager::set_sample_rate from %u to %u\n", self->m_SampleRate, rate);
@@ -1739,18 +1820,25 @@ int set_sample_rate(void* user, uint32_t rate)
     {
         if(IsStarted(self))
         {
-            do
+            /* A wait for THIS rate already ran its full budget and failed. Waiting again
+               cannot know anything the first one did not; the request above has been
+               re-sent, so let the ALSA layer get on with it. */
+            if(self->m_RateWaitTimedOutFor == rate)
             {
-                CW_msleep_interruptible(1);
-                if(++nbloop >= 4000)
-                {
-                    MTAL_DP("CManager::set_sample_rate PTP lock timed out\n");
-                    return false;
-                }
+                MTAL_DP("CManager::set_sample_rate skipping repeat PTP wait for %u\n", rate);
+                return 0;   /* see the warning above: 0, not an error */
             }
-            while (GetLockStatus(&self->m_PTP[0]) != PTPLS_LOCKED || GetLockStatus(&self->m_PTP[1]) != PTPLS_LOCKED);
+            if(!WaitForPTPLock(self))
+            {
+                MTAL_DP("CManager::set_sample_rate PTP lock timed out\n");
+                self->m_RateWaitTimedOutFor = rate;
+                return 0;   /* see the warning above: 0, not an error */
+            }
             MTAL_DP("CManager::set_sample_rate completed\n");
         }
+        /* Locked (or IO not started, so nothing to wait for): clear any earlier failure so
+           the next change starts from a clean slate. */
+        self->m_RateWaitTimedOutFor = 0;
         return 0;
     }
 }

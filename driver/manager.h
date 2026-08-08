@@ -53,6 +53,11 @@
 
 #define MAX_INTERFACE_NAME 64
 
+/// How long a sample-rate change waits for both PTP instances to re-lock, in MILLISECONDS.
+/// This is the budget the old 4000-iteration counter was aiming for; it is expressed in time
+/// now because the loop's real cost was HZ-dependent (see WaitForPTPLock in manager.c).
+#define PTP_LOCK_WAIT_MS 4000
+
 #ifndef nullptr
     #define nullptr NULL
 #endif // nullptr
@@ -77,6 +82,12 @@ struct TManager
     uint32_t m_NumberOfOutputs;
     uint64_t m_RingBufferFrameSize;
     uint32_t m_SampleRate;
+    /// Rate whose PTP-lock wait most recently TIMED OUT, or 0 when the last wait succeeded.
+    /// The ALSA layer asks for the same rate up to three times per change (hw_params once,
+    /// prepare twice), each guarded only by what the peer currently reports — so without
+    /// this, one unlockable rate change pays the timeout three times over. See
+    /// set_sample_rate().
+    uint32_t m_RateWaitTimedOutFor;
     enum eAudioMode m_AudioMode;
 
     uint64_t m_TICFrameSizeAt1FS;
