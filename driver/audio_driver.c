@@ -1158,9 +1158,32 @@ static int mr_alsa_audio_pcm_prepare(struct snd_pcm_substream *substream)
      * (set_jitter_buffer_depth — future implementation). */
     if (chip->ravenna_peer && runtime) {
         uint32_t current_ptp_frame_size;
+        /* For DSD the TIC/media clock runs at MR_ALSA_PTP_FRAME_RATE_FOR_DSD, NOT at the ALSA
+         * CONTAINER rate. runtime->rate is the container rate: DSD64 is 352800 when carried as
+         * DSD_U8 (8 bits/frame) but 88200 when carried as DSD_U32_BE (32 bits/frame). Passing it
+         * straight through therefore set a base period four times too long whenever the client
+         * chose the 32-bit container, while silently working for the 8-bit one. The manager makes
+         * exactly this distinction (IsDSDRate(m_SampleRate) ? 352800 : m_SampleRate) and this call
+         * has to agree with it, or the driver ends up holding a DSD frame size against a PCM rate.
+         *
+         * Measured on hardware 2026-08-09, x86 sender with Roon sending native DSD64 as
+         * DSD_U32_BE/88200: the manager set the TIC correctly first
+         *     UpdateFrameSize() new TIC Frame Size = 384
+         *     base period set to 1088435 ns          (384 / 352800 -- correct)
+         * and then this call overwrote it via pcm_prepare
+         *     base period set to 4353741 ns          (384 /  88200 -- 4x too long)
+         * The card never opened, Roon sat at 0:00 and tore the stream down. It reproduced
+         * identically on the SHIPPED module, so this is long-standing, not a regression.
+         * imx6 escaped it only because MPD opens DSD as DSD_U8, where container rate == 352800.
+         */
+        uint32_t dsd_mode = mr_alsa_audio_get_dsd_mode(
+            mr_alsa_audio_get_dsd_sample_rate(runtime->format, runtime->rate));
+        uint32_t base_period_rate =
+            (dsd_mode != 0) ? MR_ALSA_PTP_FRAME_RATE_FOR_DSD : runtime->rate;
+
         chip->mr_alsa_audio_ops->get_interrupts_frame_size(
             chip->ravenna_peer, &current_ptp_frame_size);
-        update_base_period(current_ptp_frame_size, runtime->rate);
+        update_base_period(current_ptp_frame_size, base_period_rate);
 
         if (chip->mr_alsa_audio_ops->set_jitter_buffer_depth) {
             chip->mr_alsa_audio_ops->set_jitter_buffer_depth(
