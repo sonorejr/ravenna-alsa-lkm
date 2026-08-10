@@ -1166,7 +1166,7 @@ static int mr_alsa_audio_pcm_prepare(struct snd_pcm_substream *substream)
          * exactly this distinction (IsDSDRate(m_SampleRate) ? 352800 : m_SampleRate) and this call
          * has to agree with it, or the driver ends up holding a DSD frame size against a PCM rate.
          *
-         * Measured on hardware 2026-08-09, x86 sender with Roon sending native DSD64 as
+         * Measured on hardware 2026-08-09, x86 sender (.222) with Roon sending native DSD64 as
          * DSD_U32_BE/88200: the manager set the TIC correctly first
          *     UpdateFrameSize() new TIC Frame Size = 384
          *     base period set to 1088435 ns          (384 / 352800 -- correct)
@@ -1944,6 +1944,77 @@ static int mr_alsa_audio_hw_rule_rate_by_format( struct snd_pcm_hw_params *param
 }
 
 
+/// Mask of every DSD format this driver can be opened with.
+static uint64_t mr_alsa_audio_dsd_format_mask(void)
+{
+    return 0
+    #ifdef SNDRV_PCM_FMTBIT_DSD_U8
+        | SNDRV_PCM_FMTBIT_DSD_U8
+    #endif
+    #ifdef SNDRV_PCM_FMTBIT_DSD_U16_BE
+        | SNDRV_PCM_FMTBIT_DSD_U16_BE
+    #endif
+    #ifdef SNDRV_PCM_FMTBIT_DSD_U16_LE
+        | SNDRV_PCM_FMTBIT_DSD_U16_LE
+    #endif
+    #ifdef SNDRV_PCM_FMTBIT_DSD_U32_BE
+        | SNDRV_PCM_FMTBIT_DSD_U32_BE
+    #endif
+    #ifdef SNDRV_PCM_FMTBIT_DSD_U32_LE
+        | SNDRV_PCM_FMTBIT_DSD_U32_LE
+    #endif
+        ;
+}
+
+/// Pin buffer_size for DSD so the ALSA buffer matches the RAVENNA ring exactly.
+///
+/// THE BUG THIS FIXES. The RAVENNA ring is a FIXED MR_ALSA_RINGBUFFER_NB_FRAMES frames, and
+/// one ALSA frame carries `nb` ring frames, where nb = MR_ALSA_PTP_FRAME_RATE_FOR_DSD / rate
+/// (DSD64: 1 as DSD_U8 at 352800, but 4 as DSD_U32_BE at 88200). The ALSA buffer must therefore
+/// be exactly RINGBUFFER/nb frames. Nothing enforced that: hw_params only WARNED after the fact
+/// ("nbPeriods (%u) differs from expected (%u)") and then ran anyway.
+///
+/// Measured on hardware 2026-08-09, Roon sending native DSD64 as DSD_U32_BE/88200 to the x86
+/// sender: Roon asked for 2 periods of 1764 frames; the geometry needs 32 periods of 384
+/// (49152 / (384 * 4)). The interrupt handler walked the full ring while ALSA saw a buffer a
+/// sixteenth of that, so the same fragment replayed over and over -- audibly "stuck, repeating
+/// rapidly", with every transport counter clean (no xrun, no overrun, no RTP error).
+///
+/// It only bites when nb > 1, i.e. DSD in a container wider than 8 bits -- which is the normal
+/// case, since USB DACs overwhelmingly take DSD_U32_BE. DSD_U8 escaped it because at nb == 1 the
+/// pointer arithmetic is geometry-independent (see the note in mr_alsa_audio_pcm_pointer), which
+/// is why DSD via MPD looked fine while DSD via Roon never did.
+///
+/// PCM is untouched: the rule refines nothing unless the format mask is DSD-only.
+static int mr_alsa_audio_hw_rule_buffer_size_by_rate_and_format(struct snd_pcm_hw_params *params,
+                                                                struct snd_pcm_hw_rule *rule)
+{
+    struct snd_interval *bs = hw_param_interval(params, SNDRV_PCM_HW_PARAM_BUFFER_SIZE);
+    struct snd_interval *r  = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
+    struct snd_mask *f      = hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT);
+    uint64_t fmask = f->bits[0] + ((uint64_t)f->bits[1] << 32);
+    uint64_t dsdmask = mr_alsa_audio_dsd_format_mask();
+    struct snd_interval t;
+    unsigned int nb;
+
+    /* Only act once the choice has narrowed to DSD alone and to a single rate; otherwise we
+     * would be guessing, and a wrong refinement here fails the open outright. */
+    if (fmask == 0 || (fmask & ~dsdmask) != 0)
+        return 0;
+    if (r->min != r->max || r->min == 0)
+        return 0;
+
+    nb = MR_ALSA_PTP_FRAME_RATE_FOR_DSD / r->min;
+    if (nb == 0 || (MR_ALSA_PTP_FRAME_RATE_FOR_DSD % r->min) != 0)
+        return 0;                       /* not a DSD container rate we generate */
+
+    snd_interval_any(&t);
+    t.min = t.max = MR_ALSA_RINGBUFFER_NB_FRAMES / nb;
+    t.integer = 1;
+
+    return snd_interval_refine(bs, &t);
+}
+
 static int mr_alsa_audio_hw_rule_period_size_by_rate(struct snd_pcm_hw_params *params,
                                                      struct snd_pcm_hw_rule *rule)
 {
@@ -2326,6 +2397,14 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
         printk(KERN_ERR "mr_alsa_audio_pcm_open: cannot constrain PERIODS to integer\n");
         return ret;
     }
+
+    /* DSD: the ALSA buffer has to match the fixed RAVENNA ring exactly, or the client picks a
+     * buffer that is a whole multiple too small and the same fragment replays forever. With
+     * PERIOD_SIZE already pinned by rate above and PERIODS constrained to an integer, fixing
+     * BUFFER_SIZE makes the period count fall out on its own. See the rule for the measurement. */
+    snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
+                        mr_alsa_audio_hw_rule_buffer_size_by_rate_and_format, chip,
+                        SNDRV_PCM_HW_PARAM_RATE, SNDRV_PCM_HW_PARAM_FORMAT, -1);
 
 #if 0
     ///rules Nb Periods by Rate
