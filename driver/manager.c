@@ -508,7 +508,7 @@ static bool AllActivePTPLocked(struct TManager* self)
     return true;
 }
 
-/// ⚠ PCM ONLY. The DSD path must keep WaitForPTPLockLegacy() below — see the warning there.
+/// Used by BOTH the PCM and DSD paths.
 ///
 /// Wait for the media clock to RE-LOCK after a rate change — i.e. observe the transition,
 /// not the level.
@@ -551,45 +551,6 @@ static bool WaitForPTPLock(struct TManager* self)
     return true;
 }
 
-//////////////////////////////////////////////////////////////////////////////////
-/// The ORIGINAL wait, kept deliberately for the DSD path. Do not "fix" this one.
-///
-/// 🛑 Replacing this with WaitForPTPLock() above BREAKS DSD PLAYBACK. Measured on hardware
-/// 2026-08-08 (imx6, DSD64 via MPD -> RAVENNA source, A/B on one box, one variable):
-///     shipped/legacy wait : 1.00x realtime   (correct)
-///     WaitForPTPLock()    : 0.14x realtime   (audible as "stuck", stretched music)
-/// 0.14 is exactly 48000/352800 — the 48 kHz baseline over the DSD_U8 frame rate.
-///
-/// The mechanism is NOT understood yet, and two plausible explanations were tested and
-/// REFUTED, so don't re-derive them:
-///   * the TIC is not left stale — the kernel log shows "base period set to 136054 ns"
-///     (= 48/352800), i.e. the timer really is running at the DSD rate; and
-///   * the bool return is not load-bearing — both callers (OnNewMessage, below) ignore it.
-/// What remains is a timing race that this loop's accidental ~32 s stall used to serialise.
-/// Note SetDSDSamplingRate() silently refuses while m_bIORunning, and its MTAL_DP diagnostic
-/// is invisible in production builds (needs MTAL_DP_ENABLE=1 at compile time), so a refused
-/// DSD rate change leaves no trace in dmesg.
-///
-/// Until someone instruments that race, DSD keeps the slow-but-correct wait. It costs a rate
-/// change into/out of DSD ~32 s, which is bad but SILENT-CORRECT; the alternative is fast and
-/// audibly wrong. PCM — the path Roon actually skips tracks on — gets the fast wait.
-///
-/// Returns true on lock, false on timeout, with the original iteration-counted budget.
-static bool WaitForPTPLockLegacy(struct TManager* self)
-{
-    uint64_t nbloop = 0;
-
-    do
-    {
-        CW_msleep_interruptible(1);
-        if(++nbloop >= 4000)
-            return false;
-    }
-    while (GetLockStatus(&self->m_PTP[0]) != PTPLS_LOCKED ||
-           GetLockStatus(&self->m_PTP[1]) != PTPLS_LOCKED);
-
-    return true;
-}
 
 //////////////////////////////////////////////////////////////////////////////////
 bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
@@ -662,9 +623,9 @@ bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
             }
         }
         start_clock_timer();
-        /* DSD deliberately keeps the LEGACY wait -- the fast one makes DSD play at 0.14x.
-           See the warning on WaitForPTPLockLegacy(). */
-        if(!WaitForPTPLockLegacy(self))
+        /* Same re-lock-aware wait as the PCM path -- see set_sample_rate() for why DSD no
+           longer uses the legacy one. */
+        if(!WaitForPTPLock(self))
         {
             MTAL_DP("CManager::SetDSDSamplingRate PTP lock timed out\n");
             return false;
@@ -1892,20 +1853,13 @@ int set_sample_rate(void* user, uint32_t rate)
     {
         if(IsStarted(self))
         {
-            /* THIS FUNCTION IS ON THE DSD PATH TOO: mr_alsa_audio_pcm_prepare calls it with
-               runtime_dsd_rate (audio_driver.c) when the DSD mode changes. The fast wait makes
-               DSD play at 0.14x (see WaitForPTPLockLegacy), so branch on the rate and give DSD
-               the original behaviour, byte for byte, including returning 0 on timeout. */
-            if(IsDSDRate(rate))
-            {
-                if(!WaitForPTPLockLegacy(self))
-                {
-                    MTAL_DP("CManager::set_sample_rate PTP lock timed out (DSD)\n");
-                    return 0;   /* the original `return false` in an int function -- keep it 0 */
-                }
-                MTAL_DP("CManager::set_sample_rate completed (DSD)\n");
-                return 0;
-            }
+            /* DSD uses the SAME re-lock-aware wait as PCM. It was briefly gated onto the legacy
+               wait after an early attempt made DSD play at 0.14x -- but that attempt used the
+               naive level-sampling wait, which returns on a STALE lock; the transition-aware one
+               below does not have that failure mode. Keeping DSD on the legacy wait cost 32 s per
+               DSD open, and Roon abandons the track at 15 s, so native DSD from Roon could never
+               start at all (measured on .222 2026-08-09: TIC correct at 1088435 ns, then a 32 s
+               timeout, then "destroyed zone ... STOPPED @ 0:00"). */
 
             /* A wait for THIS rate already ran its full budget and failed. Waiting again
                cannot know anything the first one did not; the request above has been
