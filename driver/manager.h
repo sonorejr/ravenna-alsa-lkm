@@ -47,6 +47,9 @@
 
 #include "audio_driver.h"
 
+/// work_struct for the deferred sample-rate apply (see SetSamplingRate / stopIO in manager.c).
+#include <linux/workqueue.h>
+
 #ifdef MTTRANSPARENCY_CHECK
     #include "MTTransparencyCheck.h"
 #endif
@@ -96,6 +99,12 @@ struct TManager
     /// this, one unlockable rate change pays the timeout three times over. See
     /// set_sample_rate().
     uint32_t m_RateWaitTimedOutFor;
+    /// Rate that SetSamplingRate() had to refuse because IO was running, 0 when nothing is
+    /// pending. Applied from m_RateWork, NOT inline -- see the warning in stopIO().
+    uint32_t m_PendingSampleRate;
+    /// Runs the deferred apply in PROCESS context. stopIO() is called from the ALSA trigger
+    /// callback (atomic), and applying a rate sleeps, so it cannot be done there.
+    struct work_struct m_RateWork;
     enum eAudioMode m_AudioMode;
 
     uint64_t m_TICFrameSizeAt1FS;

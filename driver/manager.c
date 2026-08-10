@@ -127,6 +127,9 @@ static int cosbuf[48] = {
 #endif // MT_TONE_TEST
 
 //////////////////////////////////////////////////////////////////////////////////
+/// Deferred sample-rate apply; defined below, next to stopIO() which schedules it.
+static void ApplyPendingSampleRateWork(struct work_struct *work);
+
 bool init(struct TManager* self, int* errorCode)
 {
     bool theAnswer = true;
@@ -154,6 +157,8 @@ bool init(struct TManager* self, int* errorCode)
     //  initialize the stuff tracked by the IORegistry
     self->m_SampleRate = DEFAULT_SAMPLERATE;
     self->m_RateWaitTimedOutFor = 0;
+    self->m_PendingSampleRate = 0;
+    INIT_WORK(&self->m_RateWork, ApplyPendingSampleRateWork);
     SetSamplingRate(self, self->m_SampleRate);
 
     self->m_TICFrameSizeAt1FS = DEFAULT_NADAC_TICFRAMESIZE;
@@ -227,6 +232,12 @@ Failure:
 void destroy(struct TManager* self)
 {
     int i = 0;
+
+    /* Before anything else: a deferred sample-rate apply may still be queued or running, and it
+     * touches self. Flushing it here (process context, so cancel_work_sync is legal) makes sure
+     * it cannot run against a manager that is being torn down. Safe if it was never queued. */
+    cancel_work_sync(&self->m_RateWork);
+
     for (i = 0; i < _MAX_NICS; i++)
     {
         MTAL_DP("CManager::destroy : self->m_EthernetFilter.Stop() succeeded\n");
@@ -336,6 +347,27 @@ bool startIO(struct TManager* self, bool is_playback)
 }
 
 //////////////////////////////////////////////////////////////////////////////////
+/// Apply a sample rate that had to be refused while IO was running. Runs in PROCESS context
+/// off the shared workqueue, which is the whole point: the request originates in stopIO(),
+/// and stopIO() is atomic (see the warning there).
+///
+/// No re-entry guard is needed. The pending rate is read and cleared before the call, and if
+/// IO has started again in the meantime SetSamplingRate() simply refuses and re-arms
+/// m_PendingSampleRate itself, so the next stopIO() reschedules us.
+static void ApplyPendingSampleRateWork(struct work_struct *work)
+{
+    struct TManager* self = container_of(work, struct TManager, m_RateWork);
+    uint32_t pending = self->m_PendingSampleRate;
+
+    self->m_PendingSampleRate = 0;
+    if(pending == 0 || pending == self->m_SampleRate)
+        return;
+
+    MTAL_DP("CManager::ApplyPendingSampleRateWork applying deferred sample rate %u\n", pending);
+    SetSamplingRate(self, pending);
+}
+
+//////////////////////////////////////////////////////////////////////////////////
 bool stopIO(struct TManager* self, bool is_playback)
 {
     MTAL_DP("MergingRAVENNAAudioDriver::stopIO\n");
@@ -356,6 +388,18 @@ bool stopIO(struct TManager* self, bool is_playback)
     }
 
     self->m_bIORunning = self->m_bIsRecordingIO || self->m_bIsPlaybackIO;
+
+    /* A rate change refused while IO was running (see SetSamplingRate) can now be applied.
+     *
+     * ⚠ SCHEDULE it -- do NOT apply it here. This function runs from stop_interrupts(), i.e.
+     * the ALSA SNDRV_PCM_TRIGGER_STOP callback, which is ATOMIC context. SetSamplingRate()
+     * sleeps (WaitForPTPLock -> CW_msleep_interruptible), and calling it from here wedged the
+     * kernel hard enough for the watchdog to reset the box (measured 2026-08-09; this driver
+     * had already shipped one sleep-in-atomic fix at 1.0-5, so it is a known hazard here).
+     * schedule_work() is safe from atomic context; the work then runs in process context where
+     * sleeping is legal. */
+    if(!self->m_bIORunning && self->m_PendingSampleRate != 0)
+        schedule_work(&self->m_RateWork);
 
     return true;
 }
@@ -563,9 +607,29 @@ bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
 
     if(self->m_bIORunning)
     {
-        MTAL_DP("CManager::SetSamplingRate(%u) not allowed when IO are running\n", samplingRate);
+        /* Refusing is right -- re-rating under a live stream is what this guard protects
+         * against -- but DROPPING the request is not. The daemon pushes the new rate over
+         * netlink the moment the source changes, while the capture stream is still running, so
+         * the refusal used to lose it entirely: m_SampleRate kept the old value, UpdateFrameSize()
+         * never ran, and the stale frame size was then combined with ALSA's new rate.
+         *
+         * Measured on the imx6 receiver, 44.1k -> 88.2k:
+         *     CManager::SetSamplingRate(88200) not allowed when IO are running   (twice)
+         *     ravenna: base period set to 544217 ns    (48 / 88200; 96 / 88200 = 1088435 is right)
+         * The bridge then ran on a half-rate clock, logged "underrun for playback hw:0", and did
+         * NOT recover on its own.
+         *
+         * So remember it; stopIO() schedules m_RateWork once the last stream stops. The supervisor
+         * stops the bridge within seconds of a rate change anyway, so it lands promptly, and
+         * nothing is mutated under a live stream.
+         *
+         * Latent all along -- the ~32 s wait this driver used to do on every rate change happened
+         * to serialise the window. Making rate changes fast is what made it reachable. */
+        MTAL_DP("CManager::SetSamplingRate(%u) not allowed when IO are running -- deferring\n", samplingRate);
+        self->m_PendingSampleRate = samplingRate;
         return false; // not allowed. stop IO first
     }
+    self->m_PendingSampleRate = 0;      /* superseded: we are applying a rate right now */
 
 
     self->m_SampleRate = samplingRate;
